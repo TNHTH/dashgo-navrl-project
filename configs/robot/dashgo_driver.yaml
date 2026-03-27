@@ -1,0 +1,26 @@
+dashgo_driver_node:
+  ros__parameters:
+    serial_port: /dev/dashgo
+    baudrate: 115200
+    serial_timeout_sec: 0.1
+    loop_rate: 50.0
+    sensorstate_rate: 10.0
+    use_base_controller: true
+    base_controller_rate: 10.0
+    base_controller_timeout_sec: 1.0
+    base_frame: base_link
+    odom_frame: odom
+    wheel_diameter: 0.1264
+    wheel_track: 0.342
+    encoder_resolution: 1200
+    gear_reduction: 1.0
+    Kp: 50.0
+    Kd: 20.0
+    Ki: 0.0
+    Ko: 50.0
+    accel_limit: 1.0
+    motors_reversed: false
+    encoder_min: -32768
+    encoder_max: 32768
+    cmd_vel_topic: /cmd_vel
+    odom_topic: /odom

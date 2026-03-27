@@ -1,0 +1,11 @@
+# @package _global_
+
+profile: pilot
+max_frame_num: 5000000
+eval_interval_batches: 25
+save_interval_batches: 25
+
+env:
+  num_envs: 8
+  static_obstacles: 48
+  dynamic_obstacles: 12

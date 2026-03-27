@@ -1,0 +1,11 @@
+# @package _global_
+
+profile: smoke
+max_frame_num: 100000
+eval_interval_batches: 10
+save_interval_batches: 10
+
+env:
+  num_envs: 4
+  static_obstacles: 24
+  dynamic_obstacles: 8

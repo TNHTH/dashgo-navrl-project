@@ -1,0 +1,11 @@
+# @package _global_
+
+profile: main
+max_frame_num: 20000000
+eval_interval_batches: 50
+save_interval_batches: 50
+
+env:
+  num_envs: 24
+  static_obstacles: 96
+  dynamic_obstacles: 24
