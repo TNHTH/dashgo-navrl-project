@@ -6,7 +6,7 @@
 在 `/home/gwh/dashgo_navrl_project` 中实现一个独立于旧仓库的 DashGo x NavRL-style 训练、评测和模型对比闭环，并保持 DashGo 实车参数一致。
 
 ## Current Phase
-Phase 18
+Phase 20
 
 ## Phases
 
@@ -109,8 +109,24 @@ Phase 18
 - [x] 按 `96 env * training_frame_num=32` 对齐 12 小时预算到 `max_frame_num=28932096`
 - [x] 在 Obsidian 建立正式执行记录并记录训练后需上传 GitHub 的后续动作
 - [x] 启动 `formal` 后台训练并确认 `batch=0`、首个 checkpoint、`run_root/tensorboard_root`
+- [x] 因用户改为要求“先测出更优训练参数”而停止并废弃首个 `96 env` formal run
+- **Status:** complete
+
+### Phase 19: GPU 利用率驱动的训练参数搜索与优化重启
+- [x] 汇总现有 `48/64/96/128 env` probe 的吞吐、显存与 GPU 利用率
+- [x] 追加 `128/160/192/224/256 env` 的 `131072 frames` 长探针
+- [x] 选出当前已测最佳配置 `256 env`
+- [x] 按 `2026-04-03 13:10:22 +0800` 结束目标重新计算预算并重启 `formal`
 - [ ] 持续值守并在训练结束后收取最终 checkpoint 与状态摘要
-- [ ] 训练完成后整理仓库变更并上传 GitHub
+- **Status:** in_progress
+
+### Phase 20: GitHub 整理、提交与上传
+- [x] 确认远端仓库 `TNHTH/dashgo-navrl-project` 存在且 SSH 可用
+- [x] 使用远端 `origin/main` 临时 clone 规避对当前运行中工作树的扰动
+- [x] 在临时 clone 中创建 `codex/bench-and-upload-20260403` 分支
+- [x] 提交 `3bf74a2 Add lifecycle safeguards and benchmark tooling`
+- [x] 推送分支到 GitHub
+- [ ] 视需要再创建 PR 或继续补充后续提交
 - **Status:** in_progress
 
 ## Key Questions
@@ -133,6 +149,9 @@ Phase 18
 | 评测循环显式控制 done env reset，并在复位后立即重算观测 | 保证 episode 终态指标来自真正结束瞬间，下一局首拍不再吃旧观测 |
 | 训练/评测工具统一通过 `src/dashgo_rl/project_paths.py::ISAAC_PYTHON` 解析入口 | 避免 `IsaacLab/_isaac_sim/python.sh` 与 `IsaacSim/python.sh` 各脚本漂移 |
 | 本轮 12 小时长跑使用 `formal + dashgo_official + 96 env + cameras off`，并只启动训练不自动串评测 | 先收集连续训练稳定性证据，避免把评测故障与训练故障混线 |
+| 在用户明确指出 GPU 利用率偏低后，优先改为“先测参再长跑” | 长跑前先把吞吐和 GPU 占用压到更优，比盲目按旧配置跑满更有效 |
+| 当前已测最佳长探针配置升级为 `formal + dashgo_official + cameras off + env.num_envs=256` | `131072 frames` 探针下测得 `3885.6 fps / 99% GPU / 62.4% memory_ratio`，优于 `96/128/160/192/224 env` |
+| 上传 GitHub 不直接改写当前正在训练的工作树，而是通过 `origin/main` 临时 clone 提交推送新分支 | 避免训练过程中文件系统切换扰动 live run |
 
 ## Errors Encountered
 | Error | Attempt | Resolution |

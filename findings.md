@@ -338,5 +338,28 @@
     - `/home/gwh/dashgo_navrl_project/artifacts/runs/smoke_20260402_235946/checkpoints/checkpoint_final.pt`
     - 已成功生成
   - quick eval smoke：
-    - `/tmp/dashgo_navrl_eval_smoke_20260402.json`
+  - `/tmp/dashgo_navrl_eval_smoke_20260402.json`
     - `status=failed` 的原因是 `behavior_gate_veto`，不是 worker 崩溃；说明生命周期修复后评测链路可正常产出结构化结果
+
+## 2026-04-03 Additional Findings: GPU 利用率优化后的当前最佳训练配置
+- 用户指出当前训练期间 GPU 利用率仍偏低，因此本轮没有继续沿用 `96 env` formal 长跑，而是先做参数搜索。
+- 已汇总旧 probe 与新增长探针：
+  - `official_e96_learn`: `2703.0 fps`, `60% GPU`, `0.504 memory_ratio`
+  - `official_e128_longprobe`: `2411.7 fps`, `62% GPU`, `0.514 memory_ratio`
+  - `official_e160_longprobe`: `2727.1 fps`, `99% GPU`, `0.817 memory_ratio`
+  - `official_e192_longprobe`: `2973.8 fps`, `100% GPU`, `0.891 memory_ratio`
+  - `official_e224_longprobe`: `3192.2 fps`, `74% GPU`, `0.609 memory_ratio`
+  - `official_e256_longprobe`: `3885.6 fps`, `99% GPU`, `0.624 memory_ratio`
+- 以“稳定成功 + 吞吐最高”为准，当前已测最佳配置更新为：
+  - `profile=formal`
+  - `env.map_source=dashgo_official`
+  - `enable_cameras=false`
+  - `env.num_envs=256`
+- 该配置已用于新的正式长跑：
+  - `run_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_003355`
+  - `frames_per_batch=8192`
+  - `total_frames=176431104`
+  - 目标结束时间按预算对齐到 `2026-04-03 13:10:22 +0800`
+- 目前判断：
+  - 原先 `96 env` 不再是最优配置
+  - 在已测集合里，`256 env` 同时给出了最高吞吐和接近满载的 GPU 利用率

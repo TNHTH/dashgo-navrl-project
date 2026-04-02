@@ -553,3 +553,59 @@
     - `tensorboard_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_001157/logs/tensorboard`
     - `batch=0 frames=3072 actor_loss=0.0002 critic_loss=0.4831 entropy=0.0002 explained_var=0.0591`
     - `checkpoint=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_001157/checkpoints/checkpoint_3072.pt`
+
+### Phase 19: GPU 利用率驱动的训练参数搜索与优化重启
+- **Status:** in_progress
+- Actions taken:
+  - 按用户要求，停止并废弃首个 `96 env` formal run：
+    - `run_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_001157`
+    - `abandoned_reason=schedule_retarget_to_2026-04-03_13:10:22+0800`
+  - 汇总既有长探针结果：
+    - `official_e96_learn -> 2703.0 fps / 60% GPU / 0.504 memory_ratio`
+  - 新增执行 `131072 frames` 长探针：
+    - `official_e128_longprobe -> 2411.7 fps / 62% GPU / 0.514 memory_ratio`
+    - `official_e160_longprobe -> 2727.1 fps / 99% GPU / 0.817 memory_ratio`
+    - `official_e192_longprobe -> 2973.8 fps / 100% GPU / 0.891 memory_ratio`
+    - `official_e224_longprobe -> 3192.2 fps / 74% GPU / 0.609 memory_ratio`
+    - `official_e256_longprobe -> 3885.6 fps / 99% GPU / 0.624 memory_ratio`
+  - 以当前已测最佳配置重启正式长跑：
+    - `python3 tools/background_train.py start --profile formal max_frame_num=176431104 env.num_envs=256`
+- Runtime facts:
+  - 新 `formal` run：
+    - `started_at=2026-04-03T00:33:47+08:00`
+    - `pid=43868`
+    - `attempt_id=20260403_003347`
+    - `run_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_003355`
+    - `tensorboard_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_003355/logs/tensorboard`
+    - `frames_per_batch=8192`
+    - `total_frames=176431104`
+    - `expected_end_at=2026-04-03 13:10:22 +0800`
+- Verification snapshot:
+  - 日志已出现：
+    - `profile=formal num_envs=256 frames_per_batch=8192 total_frames=176431104`
+    - `batch=0 frames=8192 actor_loss=0.0000 critic_loss=0.4838 entropy=0.0002 explained_var=0.0528`
+    - `checkpoint=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_003355/checkpoints/checkpoint_8192.pt`
+
+### Phase 20: GitHub 整理、提交与上传
+- **Status:** in_progress
+- Actions taken:
+  - 确认远端仓库存在且 SSH 可用：
+    - `git@github.com:TNHTH/dashgo-navrl-project.git`
+  - 为避免扰动当前 live training 工作树，使用临时 clone：
+    - `/tmp/dashgo_navrl_upload_20260403`
+  - 将当前仓库镜像到临时 clone，排除：
+    - `.git`
+    - `artifacts`
+    - `__pycache__`
+    - `*.pyc`
+    - `.tmp`
+  - 在临时 clone 中创建分支：
+    - `codex/bench-and-upload-20260403`
+  - 提交：
+    - `3bf74a2 Add lifecycle safeguards and benchmark tooling`
+  - 推送：
+    - `git push -u origin codex/bench-and-upload-20260403`
+- Verification snapshot:
+  - GitHub 已返回新分支创建成功
+  - PR 入口：
+    - `https://github.com/TNHTH/dashgo-navrl-project/pull/new/codex/bench-and-upload-20260403`
