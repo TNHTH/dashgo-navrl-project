@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -18,15 +19,16 @@ for candidate in (PROJECT_ROOT, SRC_ROOT):
     if candidate_str not in sys.path:
         sys.path.insert(0, candidate_str)
 
-from dashgo_rl.project_paths import ARTIFACTS_ROOT, PROJECT_ROOT as DASHGO_PROJECT_ROOT
+from dashgo_rl.project_paths import ARTIFACTS_ROOT, ISAAC_PYTHON, PROJECT_ROOT as DASHGO_PROJECT_ROOT
 from navrl_dashgo.runtime import write_json
-
-
-ISAAC_PYTHON = Path("/home/gwh/IsaacLab/_isaac_sim/python.sh")
 
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def now_slug() -> str:
+    return datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
 
 
 def supervisor_root(profile: str) -> Path:
@@ -70,6 +72,30 @@ def _extract_latest_value(text: str, marker: str) -> str | None:
         if marker in line:
             value = line.split(marker, 1)[1].strip()
     return value
+
+
+def _command_hash(command: list[str]) -> str:
+    encoded = json.dumps(command, ensure_ascii=False, sort_keys=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_run_status_record(run_root_value: str | None, payload: dict[str, Any]) -> None:
+    if not run_root_value:
+        return
+    run_root = Path(run_root_value)
+    run_root.mkdir(parents=True, exist_ok=True)
+    record = {
+        "profile": payload.get("profile"),
+        "run_root": str(run_root),
+        "supervisor_status": payload.get("supervisor_status"),
+        "abandoned": bool(payload.get("abandoned")),
+        "current_run_invalid": bool(payload.get("current_run_invalid")),
+        "abandoned_reason": payload.get("abandoned_reason"),
+        "abandoned_at": payload.get("abandoned_at"),
+        "abandonment_metadata": payload.get("abandonment_metadata") or {},
+        "updated_at": payload.get("updated_at"),
+    }
+    write_json(run_root / "supervisor_status.json", record)
 
 
 def _process_state(pid: int) -> str | None:
@@ -126,6 +152,15 @@ def _base_status(profile: str) -> dict[str, Any]:
         "resume_from": None,
         "run_root": None,
         "tensorboard_root": None,
+        "attempt_id": None,
+        "started_command_hash": None,
+        "latest_final_checkpoint": None,
+        "failure_reason": None,
+        "abandoned": False,
+        "current_run_invalid": False,
+        "abandoned_reason": None,
+        "abandoned_at": None,
+        "abandonment_metadata": {},
         "last_codex_requested_model": "n/a",
         "last_codex_effective_model": "n/a",
         "last_codex_requested_reasoning_effort": "n/a",
@@ -151,20 +186,34 @@ def refresh_status(profile: str) -> dict[str, Any]:
         tail = _current_attempt_tail(_tail_text(log_file))
         run_root = _extract_latest_value(tail, "run_root=")
         tensorboard_root = _extract_latest_value(tail, "tensorboard_root=")
+        final_checkpoint = _extract_latest_value(tail, "final_checkpoint=")
+        failure_reason = _extract_latest_value(tail, "failure_reason=")
         if run_root is not None:
             payload["run_root"] = run_root
         if tensorboard_root is not None:
             payload["tensorboard_root"] = tensorboard_root
+        if final_checkpoint is not None:
+            payload["latest_final_checkpoint"] = final_checkpoint
+        if failure_reason is not None:
+            payload["failure_reason"] = failure_reason
 
     if running:
         payload["supervisor_status"] = "running"
         payload["desired_state"] = "running"
         payload["next_action"] = "poll_status"
     else:
-        if "final_checkpoint=" in tail:
+        if payload.get("abandoned") or payload.get("current_run_invalid"):
+            payload["supervisor_status"] = "abandoned"
+            payload["desired_state"] = "abandoned"
+            payload["next_action"] = "start_new_run"
+        elif payload.get("latest_final_checkpoint") or "final_checkpoint=" in tail:
             payload["supervisor_status"] = "completed"
             payload["desired_state"] = "completed"
             payload["next_action"] = "run_eval"
+        elif payload.get("failure_reason"):
+            payload["supervisor_status"] = "failed"
+            payload["desired_state"] = "failed"
+            payload["next_action"] = "inspect_log"
         elif pid is not None:
             payload["supervisor_status"] = "blocked_exited"
             payload["desired_state"] = "blocked_exited"
@@ -190,10 +239,13 @@ def start_training(profile: str, overrides: list[str]) -> dict[str, Any]:
         f"profiles={profile}",
     ]
     command.extend(overrides)
+    attempt_id = now_slug()
+    command_hash = _command_hash(command)
 
     with log_path(profile).open("ab") as log_handle:
         start_marker = (
-            f"\n[Supervisor] start_at={now_iso()} profile={profile} "
+            f"\n[Supervisor] start_at={now_iso()} attempt_id={attempt_id} profile={profile} "
+            f"command_hash={command_hash} "
             f"overrides={json.dumps(overrides, ensure_ascii=False)}\n"
         )
         log_handle.write(start_marker.encode("utf-8"))
@@ -222,19 +274,57 @@ def start_training(profile: str, overrides: list[str]) -> dict[str, Any]:
             "resume_from": None,
             "started_at": now_iso(),
             "command": command,
+            "attempt_id": attempt_id,
+            "started_command_hash": command_hash,
+            "latest_final_checkpoint": None,
+            "failure_reason": None,
+            "abandoned": False,
+            "current_run_invalid": False,
+            "abandoned_reason": None,
+            "abandoned_at": None,
+            "abandonment_metadata": {},
         }
     )
     write_json(status_path(profile), payload)
     return payload
 
 
+def abandon_run(profile: str, reason: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    current = refresh_status(profile)
+    current.update(
+        {
+            "abandoned": True,
+            "current_run_invalid": True,
+            "abandoned_reason": reason,
+            "abandoned_at": now_iso(),
+            "desired_state": "abandoned",
+            "next_action": "start_new_run",
+        }
+    )
+    if metadata:
+        merged = dict(current.get("abandonment_metadata") or {})
+        merged.update(metadata)
+        current["abandonment_metadata"] = merged
+    if not _is_running(current.get("pid")):
+        current["supervisor_status"] = "abandoned"
+        current["active_process_count"] = 0
+    write_json(status_path(profile), current)
+    _write_run_status_record(current.get("run_root"), current)
+    return current
+
+
 def stop_training(profile: str, force: bool) -> dict[str, Any]:
     current = refresh_status(profile)
     pid = current.get("pid")
     if not _is_running(pid):
-        current["supervisor_status"] = "paused_inactive"
-        current["desired_state"] = "paused"
-        current["pause_scope"] = "whole_run"
+        if current.get("abandoned") or current.get("current_run_invalid"):
+            current["supervisor_status"] = "abandoned"
+            current["desired_state"] = "abandoned"
+            current["next_action"] = "start_new_run"
+        else:
+            current["supervisor_status"] = "paused_inactive"
+            current["desired_state"] = "paused"
+            current["pause_scope"] = "whole_run"
         write_json(status_path(profile), current)
         return current
 
@@ -253,15 +343,20 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     start_parser = subparsers.add_parser("start", help="启动后台训练")
-    start_parser.add_argument("--profile", default="smoke", choices=["smoke", "pilot", "main"])
+    start_parser.add_argument("--profile", default="smoke", choices=["smoke", "pilot", "main", "formal"])
     start_parser.add_argument("overrides", nargs="*", help="额外 Hydra 覆盖，例如 max_frame_num=1000")
 
     status_parser = subparsers.add_parser("status", help="查询后台训练状态")
-    status_parser.add_argument("--profile", default="smoke", choices=["smoke", "pilot", "main"])
+    status_parser.add_argument("--profile", default="smoke", choices=["smoke", "pilot", "main", "formal"])
 
     stop_parser = subparsers.add_parser("stop", help="停止后台训练")
-    stop_parser.add_argument("--profile", default="smoke", choices=["smoke", "pilot", "main"])
+    stop_parser.add_argument("--profile", default="smoke", choices=["smoke", "pilot", "main", "formal"])
     stop_parser.add_argument("--force", action="store_true", help="使用 SIGKILL 强制停止")
+
+    abandon_parser = subparsers.add_parser("abandon", help="标记当前 run 已废弃，不允许 resume")
+    abandon_parser.add_argument("--profile", default="smoke", choices=["smoke", "pilot", "main", "formal"])
+    abandon_parser.add_argument("--reason", required=True, help="废弃原因")
+    abandon_parser.add_argument("--metadata-json", default=None, help="额外 metadata 的 JSON 字符串")
     return parser
 
 
@@ -275,6 +370,9 @@ def main() -> int:
         payload = refresh_status(args.profile)
     elif args.command == "stop":
         payload = stop_training(args.profile, args.force)
+    elif args.command == "abandon":
+        metadata = json.loads(args.metadata_json) if args.metadata_json else None
+        payload = abandon_run(args.profile, args.reason, metadata)
     else:
         raise ValueError(f"未知命令: {args.command}")
 

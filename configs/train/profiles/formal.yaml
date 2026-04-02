@@ -1,0 +1,16 @@
+# @package _global_
+
+profile: formal
+max_frame_num: 165888000
+enable_cameras: false
+eval_interval_batches: 50
+save_interval_batches: 500
+
+env:
+  map_source: dashgo_official
+  num_envs: 96
+  static_obstacles: 48
+  dynamic_obstacles: 12
+
+logging:
+  print_interval_batches: 200

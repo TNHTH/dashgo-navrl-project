@@ -15,21 +15,8 @@ for candidate in (PROJECT_ROOT, SRC_ROOT):
     if candidate_str not in sys.path:
         sys.path.insert(0, candidate_str)
 
+from dashgo_rl.project_paths import ISAAC_PYTHON
 from navrl_dashgo.types import EvalRequest, EvalResult
-
-
-def resolve_isaac_python() -> Path:
-    candidates = [
-        Path.home() / "IsaacSim" / "python.sh",
-        Path.home() / "IsaacLab" / "_isaac_sim" / "python.sh",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
-
-
-ISAACLAB_PYTHON = resolve_isaac_python()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -111,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     json_out = args.json_out.resolve() if args.json_out is not None else PROJECT_ROOT / "artifacts" / "eval" / f"{args.checkpoint.stem}_{args.suite}.json"
     worker = PROJECT_ROOT / "apps" / "isaac" / "eval_worker.py"
     command = [
-        str(ISAACLAB_PYTHON),
+        str(ISAAC_PYTHON),
         str(worker),
         "--headless",
         "--checkpoint",

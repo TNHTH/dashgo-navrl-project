@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import traceback
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -78,11 +79,19 @@ def main() -> int:
         from torchrl.envs.utils import ExplorationType
 
         from navrl_dashgo.env_adapter import TorchRLDashgoEnv
-        from navrl_dashgo.ppo import PPO
+        from navrl_dashgo.ppo import NonFiniteTrainingStateError, PPO
         from navrl_dashgo.runtime import build_run_layout, write_json
 
         cfg.headless = resolved_headless
         cfg.enable_cameras = resolved_enable_cameras
+        cfg.env.map_source = str(getattr(cfg.env, "map_source", "dashgo_official")).strip().lower()
+
+        print(
+            "[DashGo-NavRL] resolved_config "
+            f"profile={cfg.profile} headless={cfg.headless} enable_cameras={cfg.enable_cameras} "
+            f"map_source={cfg.env.map_source} num_envs={cfg.env.num_envs}",
+            flush=True,
+        )
 
         env = TorchRLDashgoEnv(cfg)
         algo = PPO(cfg.algo, env.observation_spec, env.agent_action_spec, env.device)
@@ -188,6 +197,16 @@ def main() -> int:
         collector.shutdown()
         env.close()
         return 0
+    except NonFiniteTrainingStateError as exc:
+        print("[DashGo-NavRL] failure_reason=non_finite_training_state", flush=True)
+        print(f"[DashGo-NavRL] non_finite_detail={exc}", flush=True)
+        traceback.print_exc()
+        return 2
+    except Exception as exc:  # noqa: BLE001
+        print(f"[DashGo-NavRL] failure_reason=training_runtime_error:{type(exc).__name__}", flush=True)
+        print(f"[DashGo-NavRL] runtime_error_detail={exc}", flush=True)
+        traceback.print_exc()
+        return 1
     finally:
         simulation_app.close()
 

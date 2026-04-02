@@ -188,3 +188,155 @@
   - 吞吐约 `243.7 frames/s`
   - 折算 4 小时训练预算约 `3.5M frames`
   - 正式后台训练采用 `3.6M frames` 留少量缓冲
+
+## 2026-03-27 Additional Findings: 暂停后正式评测已跑通
+- 用户要求先暂停当前 `pilot_20260327_134032` 训练，再立即做正式评测。
+- 当前 supervisor 停机语义是“立即 `SIGTERM` 停止”，因此状态会落到 `blocked_exited`，这次属于预期结果，不是静默崩溃。
+- 暂停后使用最近一次已保存的 checkpoint：
+  - `/home/gwh/dashgo_navrl_project/artifacts/runs/pilot_20260327_134032/checkpoints/checkpoint_2765056.pt`
+- 正式评测前发现一个 checkpoint 兼容问题：
+  - `inference_state_dict.value_norm` 是空 `OrderedDict()`
+  - `apps/isaac/eval_worker.py` 之前对 `value_norm` 使用 `strict=True`，导致评测被兼容层阻断
+- 已修复评测兼容：
+  - `value_norm` 改为 `strict=False`
+  - 若缺少 `running_mean/running_mean_sq/debiasing_term`，只记录 note，不再阻塞正式评测
+- 修复后已跑出当前 run 的正式评测：
+  - quick: `/home/gwh/dashgo_navrl_project/artifacts/eval/pilot_20260327_134032_quick.json`
+  - main: `/home/gwh/dashgo_navrl_project/artifacts/eval/pilot_20260327_134032_main.json`
+- 结果结论：
+  - `quick` 成功率 `0.0`，碰撞率 `0.9167`，停滞率 `0.9167`
+  - `main` 成功率 `0.0`，碰撞率 `0.8542`，停滞率 `0.6875`
+  - 当前这轮 official-route checkpoint 在正式评测上明显失败，且比先前历史 run 更差
+
+## 2026-04-02 Additional Findings: 第一阶段正式基线对比已收口
+- 新增 `src/navrl_dashgo/comparison.py`，把正式对比中需要的几件事抽成稳定逻辑：
+  - 指标表生成
+  - 终止原因分布统计
+  - 失败模式提炼
+  - Markdown 报告渲染
+- `tools/compare_models.py` 现支持三种输入来源：
+  - baseline/candidate checkpoint
+  - baseline/candidate 已有 eval JSON
+  - baseline 默认从旧仓库在线 manifest 自动解析
+- 旧仓库 GeoNav 基线口径现在固定为：
+  - `/home/gwh/dashgo_rl_project/workspaces/ros2_ws/src/dashgo_rl_ros2/models/policy_torchscript.manifest.json`
+  - 其指向 checkpoint 为 `/home/gwh/dashgo_rl_project/.artifacts/autopilot/runs/gen2/20260319_113548_wave50_gen2_model704_escapecurriculum05_softgeometry_seed44/checkpoints/model_883.pt`
+- 基线正式 quick/main 结果表明，旧在线 GeoNav 自身也没有通过当前行为 gate：
+  - quick: `success_rate=0.0833`, `collision_rate=0.0`, `timeout_rate=0.9167`, `orbit_score=1.0`, `score=-65.34`
+  - main: `success_rate=0.1042`, `collision_rate=0.0`, `timeout_rate=0.8958`, `orbit_score=1.0`, `score=-50.42`
+- 这说明当前主线 GeoNav 的主要问题不是碰撞，而是：
+  - timeout 主导
+  - 高饱和
+  - orbit/local minimum 明显
+- 与之对比，NavRL-style 候选 `pilot_20260327_134032/checkpoint_2765056.pt` 的失败模式更偏向：
+  - 碰撞主导
+  - progress stall 更高
+  - harder suite 下整体分数低于基线
+- 第一阶段正式结论已固定为：
+  - `quick`：候选没有形成成功 episode，但因为基线几乎全是 timeout/orbit，候选 `score` 略高于基线
+  - `main`：候选整体劣于基线
+  - 因此不能宣称 NavRL-style 已超过当前 GeoNav 主线
+- 但这并不推翻第一阶段价值，因为第一阶段真正完成的是：
+  - NavRL-style on DashGo 的训练闭环
+  - NavRL-style on DashGo 的正式评测闭环
+  - 与旧在线 GeoNav 的同协议正式对比
+- 第二阶段边界也已固定为：
+  - 不直接移植 upstream `onboard_detector + safe_action`
+  - 改为围绕 DashGo `LaserScan + odom + goal + global plan` 合同做动态障碍与安全接口设计
+
+## 2026-04-02 Additional Findings: 本机训练模式摸索已收敛
+- 已对 official-route 做一组最小算法修正：
+  - `goal_termination_threshold: 0.5 -> 0.6`
+  - 新增弱权重 `navrl_waypoint_velocity`
+  - `navrl_survival` 权重显著下调
+  - 保持 `static/dynamic collision threshold=0.3` 不变，避免靠放松安全线抬指标
+- 已为训练环境增加 `env.map_source`：
+  - `dashgo_official`：当前正式 DashGo 对比口径
+  - `navrl_upstream`：更接近 upstream NavRL 的静态障碍高度分布与平台宽度
+- 关于“验证地图能否用 NavRL 自带地图”的当前结论：
+  - 配置入口已经打通，可以通过 `env.map_source=navrl_upstream` 切换
+  - 但当前运行期仍存在兼容问题：进程会在 `Simulation App Startup Complete` 后静默退出，尚未进入 `run_root` 打印阶段
+  - 因此 upstream 地图模式目前适合继续单独修复，不应阻塞这轮正式长跑
+- 本机吞吐摸索结果显示，当前 RTX 4060 8GB 的最佳训练模式明显不是历史 `8 env`：
+  - `official_e8_camoff`: `223 fps`
+  - `official_e24_camoff`: `446 fps`
+  - `official_e64_camoff`: `617 fps`
+  - `official_e96_camoff`: `670 fps`
+  - `official_e128_camoff`: `726 fps`，但只做了短吞吐探针，未做更长自治回归
+  - `official_e8_camon`: `217 fps`，且显存占比高于同档 `camoff`
+- 结合“吞吐 + 更长短跑回归”的折中，正式长跑选择：
+  - `env.num_envs=96`
+  - `env.map_source=dashgo_official`
+  - `enable_cameras=false`
+  - 理由：`96 env` 已通过更长短跑与自治链回归；`128 env` 虽更快，但只做了短吞吐探针，稳定性证据不足
+
+## 2026-04-02 Additional Findings: 自治训练链已修到可后台长期运行
+- 新增 `tools/benchmark_train_modes.py`：
+  - 自动跑候选训练模式短跑
+  - 记录 `frames_per_second / peak_memory_ratio / final_checkpoint`
+- 新增 `tools/autonomous_training_cycle.py`：
+  - 启动后台训练
+  - 轮询 supervisor 状态
+  - 训练完成后自动跑 `quick/main`
+  - 自动生成与旧在线基线的 `compare_quick/compare_main`
+- 自治链修复了两个关键问题：
+  - 不能把 `eval_checkpoint.py` 的非零返回码直接视为周期失败，因为候选行为 gate 失败时也要保留 JSON
+  - 训练刚退出后立刻拉第二个 Isaac 实例会偶发 `bad_optional_access`；现在通过冷却 + 重试规避
+- 当前正式自治周期已启动：
+  - `cycle_root=/home/gwh/dashgo_navrl_project/artifacts/autonomous/20260402_210824`
+  - `run_root=/home/gwh/dashgo_navrl_project/artifacts/runs/pilot_20260402_210831`
+  - `six_hour_mark_at=2026-04-03T03:08:24+08:00`
+  - `expected_end_at=2026-04-03T14:08:24+08:00`
+
+## 2026-04-02 Additional Findings: 长跑复盘已推翻“正式结果可直接收取”的判断
+- 已基于代码静态审查、live `train.log`、`status.json` 与 benchmark 结果做交叉复盘，形成正式文档：
+  - `/home/gwh/文档/Obsidian Vault/03_项目记录/DashGo/DashGo_NavRL_Longrun_Retro_2026-04-02_22-28.md`
+- 当前 `96 env + dashgo_official + enable_cameras=false` 仍更像“本机硬件最优训练模式”，但不能再直接等同于“正式可信训练模式”。
+- 当前 `17` 小时自治长跑应降级为 debug 样本，而不是继续视作正式比较来源。
+- 关键原因不是吞吐判断错了，而是 correctness blocker 尚未收口：
+  - `autonomous_training_cycle.py` 仍存在“failed eval payload 也可能被判完成”的假阳性风险
+  - `PPO/GAE` 仍未把 `truncated` 纳入 bootstrap 截断
+  - `navrl_upstream` 地图模式高概率存在当前 Isaac Lab API 不兼容
+  - benchmark 默认候选集、统计口径与并发保护仍不足以长期支撑正式决策
+- live 训练日志已出现明确失稳边界：
+  - `frames=6147072` 起，`actor_loss / critic_loss / entropy / explained_var` 持续为 `NaN`
+  - 因此 `checkpoint_6147072.pt` 及之后应视为无效
+  - `checkpoint_4611072.pt` 及之前只保留作 pre-fix debug/warm-start 样本，不再作为正式结果模型
+- 当前阶段更合理的收口是：
+  - 先停掉当前长跑
+  - 先修 correctness blocker
+  - 再开新的短验证和正式长跑
+
+## 2026-04-03 Additional Findings: TorchRL 与评测生命周期 correctness 已修复
+- 严格 review 进一步确认了三条会直接污染训练和评测结论的生命周期问题：
+  - `src/navrl_dashgo/env_adapter.py` 的 `_reset()` 之前忽略 TorchRL `tensordict["_reset"]` 的局部语义，只要 collector 请求 reset，就可能整批调用 `base_env.reset()`
+  - Isaac Lab `ManagerBasedRLEnv.step()` 会在返回前 auto-reset done env，因此评测侧不能再在 `step()` 之后直接把当前位置当成 episode 终态
+  - `apps/isaac/eval_worker.py` 之前在 recycle env 重新布场景后没有刷新 `raw_obs`，新 episode 第一拍动作基于旧观测
+- 已完成训练侧修复：
+  - `src/navrl_dashgo/env_adapter.py` 新增 `_collapse_reset_mask / _resolve_reset_env_ids / _envs_already_autoreset / _current_raw_obs`
+  - `_reset()` 现在会先解析 `_reset` 掩码为局部 `env_ids`
+  - 若目标 env 已在 Isaac Lab `step()` 中 auto-reset，则直接复用当前观测，不再二次 reset
+  - 若目标 env 尚未 reset，则只对这些 `env_ids` 调用 `base_env.reset(env_ids=...)`
+- 已完成评测侧修复：
+  - `apps/isaac/eval_worker.py` 新增 `step_env_without_auto_reset()`，先保留终态数据，再让评测循环决定何时 reset
+  - `apps/isaac/eval_worker.py` 新增 `reset_done_envs_for_next_episode()`，在 `initialize_episode_state()` 之后立即重算观测
+  - 因此 `path_length / end_distance / path_efficiency / progress_stall` 不再被 reset 后状态污染
+- 工具链一致性已收口：
+  - `src/dashgo_rl/project_paths.py` 新增 `resolve_isaac_python()` 与 `ISAAC_PYTHON`
+  - `tools/background_train.py`、`tools/benchmark_train_modes.py`、`tools/eval_checkpoint.py` 已统一改用该入口
+- 新增回归测试：
+  - `tests/test_env_and_ppo_guards.py` 新增两条 partial reset 用例，覆盖“已 auto-reset 直接复用当前 obs”和“尚未 reset 时只 reset 指定 env_ids”
+  - 新增 `tests/test_eval_worker_flow.py`，覆盖“step 不 auto-reset”和“recycle 后刷新观测”
+- 验证结果：
+  - `PYTHONPATH=src:. /home/gwh/IsaacLab/_isaac_sim/python.sh -m unittest tests.test_env_and_ppo_guards tests.test_eval_worker_flow -q`
+    - `11` 项通过
+  - `PYTHONPATH=src:. /home/gwh/IsaacLab/_isaac_sim/python.sh -m unittest discover -s tests -q`
+    - `28` 项通过
+  - `/home/gwh/IsaacLab/_isaac_sim/python.sh -m py_compile ...`
+    - 已覆盖本轮修改文件并通过
+  - smoke 训练：
+    - `/home/gwh/dashgo_navrl_project/artifacts/runs/smoke_20260402_235946/checkpoints/checkpoint_final.pt`
+    - 已成功生成
+  - quick eval smoke：
+    - `/tmp/dashgo_navrl_eval_smoke_20260402.json`
+    - `status=failed` 的原因是 `behavior_gate_veto`，不是 worker 崩溃；说明生命周期修复后评测链路可正常产出结构化结果

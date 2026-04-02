@@ -15,6 +15,8 @@ from isaaclab.terrains.height_field import HfDiscreteObstaclesTerrainCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import euler_xyz_from_quat, quat_from_euler_xyz, wrap_to_pi
 
+from navrl_dashgo.semantics import build_reference_path_progress, compute_waypoint_lookahead_indices
+
 from .dashgo_assets import DASHGO_D1_CFG
 from .dashgo_config import DashGoROSParams
 
@@ -38,9 +40,30 @@ MOTION_CONFIG = {
     "max_wheel_vel": 5.0,
 }
 REWARD_CONFIG = {
-    "goal_termination_threshold": 0.5,
+    # 保持碰撞判据不变，避免靠放松安全线“做高”成功率。
+    "goal_termination_threshold": 0.6,
+    "goal_stop_velocity": 0.08,
     "dynamic_collision_threshold": 0.3,
     "static_collision_threshold": 0.3,
+    "survival_weight": 0.15,
+    "goal_velocity_weight": 1.0,
+    "waypoint_velocity_weight": 0.35,
+    "static_safety_weight": 1.0,
+    "dynamic_safety_weight": 1.0,
+    "twist_smoothness_weight": -0.1,
+    "progress_stall_weight": -0.2,
+    "orbit_weight": -0.15,
+    "stall_activation_distance": 0.75,
+    "stall_min_progress": 0.005,
+    "stall_max_forward_speed": 0.05,
+    "stall_warmup_steps": 15,
+    "stall_trigger_steps": 8,
+    "orbit_activation_distance": 0.75,
+    "orbit_min_progress": 0.01,
+    "orbit_min_angular_speed": 0.35,
+    "orbit_max_forward_speed": 0.18,
+    "orbit_warmup_steps": 20,
+    "orbit_trigger_steps": 10,
 }
 MAX_DYNAMIC_SCENE_OBJECTS = 24
 DEFAULT_DYNAMIC_OBSTACLE_COUNT = 8
@@ -108,6 +131,71 @@ def build_navrl_terrain_cfg(num_obstacles: int) -> TerrainImporterCfg:
             dynamic_friction=1.0,
         ),
     )
+
+
+def build_navrl_upstream_terrain_cfg(num_obstacles: int) -> TerrainImporterCfg:
+    """保留 DashGo 底盘语义，但把静态地图形态切到更接近 upstream NavRL 的障碍地形。"""
+    return TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="generator",
+        terrain_generator=TerrainGeneratorCfg(
+            seed=0,
+            curriculum=False,
+            size=(20.0, 20.0),
+            border_width=5.0,
+            num_rows=1,
+            num_cols=1,
+            horizontal_scale=0.1,
+            vertical_scale=0.1,
+            slope_threshold=0.75,
+            # 当前 Isaac Lab / trimesh 组合会把 "height" 映射到默认 turbo colormap，
+            # 但本机环境只内置 magma/inferno/plasma/viridis，直接关闭颜色映射避免启动失败。
+            color_scheme="none",
+            use_cache=False,
+            sub_terrains={
+                "obstacles": HfDiscreteObstaclesTerrainCfg(
+                    proportion=1.0,
+                    horizontal_scale=0.1,
+                    vertical_scale=0.1,
+                    border_width=0.0,
+                    obstacle_height_mode="choice",
+                    obstacle_width_range=(0.4, 1.1),
+                    obstacle_height_range=(1.0, 6.0),
+                    num_obstacles=max(0, int(num_obstacles)),
+                    platform_width=0.0,
+                ),
+            },
+        ),
+        max_init_terrain_level=0,
+        collision_group=-1,
+        debug_vis=False,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="average",
+            restitution_combine_mode="average",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+        ),
+    )
+
+
+def terrain_debug_summary(map_source: str, num_obstacles: int) -> dict[str, float | int | str]:
+    if map_source == "navrl_upstream":
+        return {
+            "map_source": map_source,
+            "obstacle_height_mode": "choice",
+            "obstacle_height_range_min": 1.0,
+            "obstacle_height_range_max": 6.0,
+            "platform_width": 0.0,
+            "num_obstacles": int(num_obstacles),
+        }
+    return {
+        "map_source": map_source,
+        "obstacle_height_mode": "fixed",
+        "obstacle_height_range_min": 1.0,
+        "obstacle_height_range_max": 1.0,
+        "platform_width": 2.0,
+        "num_obstacles": int(num_obstacles),
+    }
 
 
 def build_dynamic_obstacle_collection_cfg(num_slots: int = MAX_DYNAMIC_SCENE_OBJECTS) -> RigidObjectCollectionCfg:
@@ -445,6 +533,14 @@ def reward_navrl_goal_velocity(
     return reward_distance_tracking_potential(env, command_name, asset_cfg, target_kind="goal")
 
 
+def reward_navrl_waypoint_velocity(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    return reward_distance_tracking_potential(env, command_name, asset_cfg, target_kind="waypoint")
+
+
 def reward_navrl_static_safety(env: ManagerBasedRLEnv) -> torch.Tensor:
     clearance = torch.clamp(_get_lidar_scan_m(env), min=1.0e-6, max=SIM_LIDAR_MAX_RANGE)
     return torch.nan_to_num(torch.log(clearance).mean(dim=1), nan=0.0, posinf=0.0, neginf=0.0)
@@ -529,6 +625,114 @@ def penalty_navrl_twist_smoothness(env: ManagerBasedRLEnv, asset_cfg: SceneEntit
     return torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def penalty_navrl_progress_stall(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    target_kind: str = "waypoint",
+    activation_distance: float = 0.75,
+    min_progress: float = 0.005,
+    max_forward_speed: float = 0.05,
+    warmup_steps: int = 15,
+    trigger_steps: int = 8,
+) -> torch.Tensor:
+    if target_kind == "waypoint":
+        target_pos = _get_command_waypoint_pos_w(env, command_name, asset_cfg)[:, :2]
+    else:
+        target_pos = _get_command_target_pos_w(env, command_name)[:, :2]
+
+    robot = env.scene[asset_cfg.name]
+    robot_pos = torch.nan_to_num(robot.data.root_pos_w[:, :2], nan=0.0, posinf=0.0, neginf=0.0)
+    dist = torch.norm(target_pos - robot_pos, dim=-1)
+    forward_speed = torch.abs(torch.nan_to_num(robot.data.root_lin_vel_b[:, 0], nan=0.0, posinf=0.0, neginf=0.0))
+
+    if not hasattr(env, "_navrl_prev_target_distance"):
+        env._navrl_prev_target_distance = dist.detach().clone()
+    if not hasattr(env, "_navrl_stall_counts"):
+        env._navrl_stall_counts = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+
+    env._navrl_stall_counts[env.episode_length_buf < 2] = 0
+    prev_dist = env._navrl_prev_target_distance
+    progress = prev_dist - dist
+    env._navrl_prev_target_distance = dist.detach().clone()
+
+    stalled = (
+        (env.episode_length_buf > warmup_steps)
+        & (dist > activation_distance)
+        & (progress < min_progress)
+        & (forward_speed < max_forward_speed)
+    )
+    env._navrl_stall_counts = torch.where(
+        stalled,
+        env._navrl_stall_counts + 1,
+        torch.zeros_like(env._navrl_stall_counts),
+    )
+    penalty = torch.clamp(
+        (env._navrl_stall_counts.float() - float(trigger_steps)) / float(max(trigger_steps, 1)),
+        min=0.0,
+        max=1.0,
+    )
+    return torch.nan_to_num(penalty, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def penalty_navrl_orbiting(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    target_kind: str = "waypoint",
+    activation_distance: float = 0.75,
+    min_progress: float = 0.01,
+    min_angular_speed: float = 0.35,
+    max_forward_speed: float = 0.18,
+    warmup_steps: int = 20,
+    trigger_steps: int = 10,
+) -> torch.Tensor:
+    if target_kind == "waypoint":
+        target_pos = _get_command_waypoint_pos_w(env, command_name, asset_cfg)[:, :2]
+    else:
+        target_pos = _get_command_target_pos_w(env, command_name)[:, :2]
+
+    robot = env.scene[asset_cfg.name]
+    robot_pos = torch.nan_to_num(robot.data.root_pos_w[:, :2], nan=0.0, posinf=0.0, neginf=0.0)
+    dist = torch.norm(target_pos - robot_pos, dim=-1)
+    forward_speed = torch.abs(torch.nan_to_num(robot.data.root_lin_vel_b[:, 0], nan=0.0, posinf=0.0, neginf=0.0))
+    angular_speed = torch.abs(torch.nan_to_num(robot.data.root_ang_vel_b[:, 2], nan=0.0, posinf=0.0, neginf=0.0))
+
+    if not hasattr(env, "_navrl_orbit_prev_target_distance"):
+        env._navrl_orbit_prev_target_distance = dist.detach().clone()
+    if not hasattr(env, "_navrl_orbit_counts"):
+        env._navrl_orbit_counts = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+
+    env._navrl_orbit_counts[env.episode_length_buf < 2] = 0
+    prev_dist = env._navrl_orbit_prev_target_distance
+    progress = prev_dist - dist
+    env._navrl_orbit_prev_target_distance = dist.detach().clone()
+
+    orbiting = (
+        (env.episode_length_buf > warmup_steps)
+        & (dist > activation_distance)
+        & (progress < min_progress)
+        & (angular_speed > min_angular_speed)
+        & (forward_speed < max_forward_speed)
+    )
+    env._navrl_orbit_counts = torch.where(
+        orbiting,
+        env._navrl_orbit_counts + 1,
+        torch.zeros_like(env._navrl_orbit_counts),
+    )
+    penalty = torch.clamp(
+        (env._navrl_orbit_counts.float() - float(trigger_steps)) / float(max(trigger_steps, 1)),
+        min=0.0,
+        max=1.0,
+    )
+    speed_scale = torch.clamp(
+        (angular_speed - min_angular_speed) / max(MOTION_CONFIG["max_ang_vel"] - min_angular_speed, 1.0e-3),
+        min=0.0,
+        max=1.0,
+    )
+    return torch.nan_to_num(penalty * speed_scale, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def log_distance_to_goal(env: ManagerBasedRLEnv, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     target_pos = _get_command_target_pos_w(env, command_name)[:, :2]
     robot_pos = torch.nan_to_num(env.scene[asset_cfg.name].data.root_pos_w[:, :2], nan=0.0, posinf=0.0, neginf=0.0)
@@ -547,10 +751,19 @@ def check_collision_navrl_style(env: ManagerBasedRLEnv, static_threshold: float,
     return static_collision | dynamic_collision
 
 
-def check_reach_goal(env: ManagerBasedRLEnv, command_name: str, threshold: float, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+def check_reach_goal(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    threshold: float,
+    speed_threshold: float,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
     target_pos_w = _get_command_target_pos_w(env, command_name)[:, :2]
     robot_pos = torch.nan_to_num(env.scene[asset_cfg.name].data.root_pos_w[:, :2], nan=0.0, posinf=0.0, neginf=0.0)
-    return torch.norm(target_pos_w - robot_pos, dim=-1) < threshold
+    lin_vel_b = torch.nan_to_num(env.scene[asset_cfg.name].data.root_lin_vel_b[:, :2], nan=0.0, posinf=0.0, neginf=0.0)
+    dist = torch.norm(target_pos_w - robot_pos, dim=-1)
+    speed = torch.norm(lin_vel_b, dim=-1)
+    return (dist < threshold) & (speed < speed_threshold)
 
 
 def check_time_out(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -591,6 +804,10 @@ class RelativeNavRLTargetCommand(mdp.UniformPoseCommand):
         self.min_dist = GOAL_DISTANCE_RANGE[0]
         self.max_dist = GOAL_DISTANCE_RANGE[1]
         self.max_path_points = OBSERVATION_CONFIG["max_path_points"]
+        self.waypoint_lookahead_steps = max(
+            1,
+            int(math.ceil(OBSERVATION_CONFIG["waypoint_distance"] / OBSERVATION_CONFIG["path_resolution"])),
+        )
         self.pose_command_w = torch.zeros(self.num_envs, 7, device=self.device)
         self.goal_pose_w = torch.zeros(self.num_envs, 7, device=self.device)
         self.waypoint_pose_w = torch.zeros(self.num_envs, 7, device=self.device)
@@ -611,9 +828,7 @@ class RelativeNavRLTargetCommand(mdp.UniformPoseCommand):
             min=2,
             max=self.max_path_points,
         )
-        t = torch.linspace(0.0, 1.0, self.max_path_points, device=self.device).unsqueeze(0)
-        goal_progress = (steps - 1).clamp(min=1).unsqueeze(-1).float()
-        scaled_t = torch.clamp(t * goal_progress, max=goal_progress) / goal_progress
+        scaled_t = build_reference_path_progress(self.max_path_points, steps)
         interp_xy = start_xy.unsqueeze(1) + delta.unsqueeze(1) * scaled_t.unsqueeze(-1)
         path = torch.zeros(batch_size, self.max_path_points, 3, device=self.device)
         path[:, :, :2] = interp_xy
@@ -630,15 +845,12 @@ class RelativeNavRLTargetCommand(mdp.UniformPoseCommand):
         masked_distances = torch.where(mask, distances, torch.full_like(distances, 1.0e6))
         nearest_idx = torch.argmin(masked_distances, dim=1)
         self.reference_path_cursor = torch.maximum(self.reference_path_cursor, nearest_idx)
-        fallback_idx = (self.reference_path_len - 1).clamp(min=0)
-        target_mask = mask & (
-            torch.arange(self.max_path_points, device=self.device).unsqueeze(0) >= self.reference_path_cursor.unsqueeze(1)
+        selected_idx = compute_waypoint_lookahead_indices(
+            self.reference_path_cursor,
+            self.reference_path_len,
+            self.waypoint_lookahead_steps,
         )
-        has_target = torch.any(target_mask, dim=1)
-        candidate_idx = torch.argmax(target_mask.to(torch.int64), dim=1)
-        selected_idx = torch.where(has_target, candidate_idx, fallback_idx)
-        self.reference_path_cursor = torch.maximum(self.reference_path_cursor, selected_idx)
-        selected = self.reference_path_w[torch.arange(self.num_envs, device=self.device), self.reference_path_cursor]
+        selected = self.reference_path_w[torch.arange(self.num_envs, device=self.device), selected_idx]
         self.waypoint_pose_w[:, :3] = selected
         self.waypoint_pose_w[:, 3] = 1.0
         self.waypoint_pose_w[:, 4:] = 0.0
@@ -797,18 +1009,52 @@ class DashgoSceneOfficialCfg(InteractiveSceneCfg):
 
 @configclass
 class DashgoRewardsOfficialCfg:
-    navrl_survival = RewardTermCfg(func=reward_navrl_survival_bias, weight=1.0)
+    navrl_survival = RewardTermCfg(func=reward_navrl_survival_bias, weight=REWARD_CONFIG["survival_weight"])
     navrl_goal_velocity = RewardTermCfg(
         func=reward_navrl_goal_velocity,
-        weight=1.0,
+        weight=REWARD_CONFIG["goal_velocity_weight"],
         params={"command_name": "target_pose", "asset_cfg": SceneEntityCfg("robot")},
     )
-    navrl_static_safety = RewardTermCfg(func=reward_navrl_static_safety, weight=1.0)
-    navrl_dynamic_safety = RewardTermCfg(func=reward_navrl_dynamic_safety, weight=1.0)
+    navrl_waypoint_velocity = RewardTermCfg(
+        func=reward_navrl_waypoint_velocity,
+        weight=REWARD_CONFIG["waypoint_velocity_weight"],
+        params={"command_name": "target_pose", "asset_cfg": SceneEntityCfg("robot")},
+    )
+    navrl_static_safety = RewardTermCfg(func=reward_navrl_static_safety, weight=REWARD_CONFIG["static_safety_weight"])
+    navrl_dynamic_safety = RewardTermCfg(func=reward_navrl_dynamic_safety, weight=REWARD_CONFIG["dynamic_safety_weight"])
     navrl_twist_smoothness = RewardTermCfg(
         func=penalty_navrl_twist_smoothness,
-        weight=-0.1,
+        weight=REWARD_CONFIG["twist_smoothness_weight"],
         params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+    navrl_progress_stall = RewardTermCfg(
+        func=penalty_navrl_progress_stall,
+        weight=REWARD_CONFIG["progress_stall_weight"],
+        params={
+            "command_name": "target_pose",
+            "asset_cfg": SceneEntityCfg("robot"),
+            "target_kind": "waypoint",
+            "activation_distance": REWARD_CONFIG["stall_activation_distance"],
+            "min_progress": REWARD_CONFIG["stall_min_progress"],
+            "max_forward_speed": REWARD_CONFIG["stall_max_forward_speed"],
+            "warmup_steps": REWARD_CONFIG["stall_warmup_steps"],
+            "trigger_steps": REWARD_CONFIG["stall_trigger_steps"],
+        },
+    )
+    navrl_orbit = RewardTermCfg(
+        func=penalty_navrl_orbiting,
+        weight=REWARD_CONFIG["orbit_weight"],
+        params={
+            "command_name": "target_pose",
+            "asset_cfg": SceneEntityCfg("robot"),
+            "target_kind": "waypoint",
+            "activation_distance": REWARD_CONFIG["orbit_activation_distance"],
+            "min_progress": REWARD_CONFIG["orbit_min_progress"],
+            "min_angular_speed": REWARD_CONFIG["orbit_min_angular_speed"],
+            "max_forward_speed": REWARD_CONFIG["orbit_max_forward_speed"],
+            "warmup_steps": REWARD_CONFIG["orbit_warmup_steps"],
+            "trigger_steps": REWARD_CONFIG["orbit_trigger_steps"],
+        },
     )
     log_distance = RewardTermCfg(
         func=log_distance_to_goal,
@@ -826,6 +1072,7 @@ class DashgoTerminationsOfficialCfg:
         params={
             "command_name": "target_pose",
             "threshold": REWARD_CONFIG["goal_termination_threshold"],
+            "speed_threshold": REWARD_CONFIG["goal_stop_velocity"],
             "asset_cfg": SceneEntityCfg("robot"),
         },
     )

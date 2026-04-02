@@ -31,6 +31,21 @@ EAI_PARAMS_YAML = CONFIGS_ROOT / "robot" / "dashgo_driver.yaml"
 TRAIN_CONFIG_ROOT = CONFIGS_ROOT / "train"
 
 
+def resolve_isaac_python() -> Path:
+    """统一解析当前仓库约定的 Isaac Python 入口。"""
+    candidates = [
+        Path.home() / "IsaacLab" / "_isaac_sim" / "python.sh",
+        Path.home() / "IsaacSim" / "python.sh",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0]
+
+
+ISAAC_PYTHON = resolve_isaac_python()
+
+
 def ensure_project_sys_path() -> Path:
     """供脚本入口在运行前注入项目与 src 路径。"""
     import sys

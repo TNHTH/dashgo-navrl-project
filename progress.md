@@ -218,6 +218,56 @@
   - `apps/isaac/eval_worker.py`
   - `configs/train/train.yaml`
   - `task_plan.md`
+
+## Session: 2026-04-02
+
+### Phase 16: correctness blocker 修复与 Gate 0/1 验证
+- **Status:** in_progress
+- Actions taken:
+  - 停止并废弃 `pilot_20260402_210831`，把 `abandoned/current_run_invalid=true` 同步写入 supervisor 状态和 run 级记录
+  - 为 `background_train.py` 增加 `attempt_id / started_command_hash / latest_final_checkpoint / failure_reason / abandon` 语义
+  - 为 `autonomous_training_cycle.py` 增加 `pid / attempt / command_hash / run_root / final_checkpoint` 强绑定与漂移失败收口
+  - 为 `compare_models.py` 与 `comparison.py` 增加 eval/comparison payload 校验，拒绝 failed payload 假阳性
+  - 重写 `benchmark_train_modes.py` 的正式候选集、重复统计、决策门槛与并发保护
+  - 修复 `navrl_upstream` 的 terrain API 配置，并追加 `color_scheme=\"none\"` 兼容补丁
+  - 修复 reward/termination 与 PPO 的 `truncated -> done`、finite guard、non-finite fail-fast
+  - 新增 `formal` profile，但按用户最新要求暂不启动正式长训
+  - 跑通 Gate 0 全量单测与 Gate 1 双地图训练烟测
+  - 运行最小自治 cycle 烟测，确认 failed eval 不会再把 cycle 写成 completed
+- Files created/modified:
+  - `tools/background_train.py`
+  - `tools/autonomous_training_cycle.py`
+  - `tools/benchmark_train_modes.py`
+  - `tools/compare_models.py`
+  - `src/navrl_dashgo/comparison.py`
+  - `src/navrl_dashgo/env_adapter.py`
+  - `src/navrl_dashgo/ppo.py`
+  - `src/dashgo_rl/dashgo_env_navrl_official.py`
+  - `apps/isaac/train_navrl.py`
+  - `configs/train/profiles/formal.yaml`
+  - `tests/test_autonomous_training_cycle.py`
+  - `tests/test_benchmark_train_modes.py`
+  - `tests/test_comparison.py`
+  - `tests/test_env_and_ppo_guards.py`
+  - `docs/formal_repair_validation_2026-04-02_23-08.md`
+  - `task_plan.md`
+  - `progress.md`
+
+## Additional Test Results
+| Test | Input | Expected | Actual | Status |
+|------|-------|----------|--------|--------|
+| Gate 0 全量单测 | `unittest discover -s tests -v` | `cycle / benchmark / map_source / truncated / finite guard` 全通过 | `18` 项通过 | ✓ |
+| `dashgo_official` 烟测 | `smoke max_frame_num=1024 env.num_envs=8` | 训练可启动、落 checkpoint、无 NaN | `checkpoint_final.pt` 已生成，日志无指标 NaN | ✓ |
+| `navrl_upstream` 首次烟测 | 同上，`map_source=navrl_upstream` | 应稳定启动 | 首次因 `color_scheme=height` 触发 colormap 错误失败 | ✓ |
+| `navrl_upstream` 修复后烟测 | 修复后同命令重跑 | 稳定启动、落 checkpoint、无 NaN | `checkpoint_final.pt` 已生成，日志无指标 NaN | ✓ |
+| cycle 失败收口烟测 | `autonomous_training_cycle.py --profile smoke ...` | failed eval 不应写成 completed | 最终 `phase=failed`, `failure_reason=eval_quick_invalid[...]` | ✓ |
+| compare 成功收口验证 | 合成 completed baseline/candidate JSON | compare 成功输出 JSON/MD | 退出码 `0`，报告已生成 | ✓ |
+
+## Additional Error Log
+| Timestamp | Error | Attempt | Resolution |
+|-----------|-------|---------|------------|
+| 2026-04-02 22:55 | `navrl_upstream` 初始化时报 `Included color maps are ...` | 1 | 将 upstream terrain `color_scheme` 从 `height` 改为 `none` |
+| 2026-04-02 23:04 | smoke cycle 的 `quick eval` 返回 `status=failed` | 1 | 新 cycle 正确拒绝该 artifact，并以 `eval_quick_invalid` 收口失败 |
   - `findings.md`
   - `progress.md`
 
@@ -274,3 +324,232 @@
   - supervisor: `running`
   - log: 已出现 `run_root / tensorboard_root / batch=0 / checkpoint_256.pt`
   - process table: `python.sh train_navrl.py ... max_frame_num=3600000 ...` 仍在运行
+
+### Phase 13: 暂停训练并执行正式评测
+- **Status:** complete
+- Actions taken:
+  - 按用户要求暂停当前 `pilot_20260327_134032` 训练
+  - 选取最近一次已保存的 `checkpoint_2765056.pt` 作为正式评测输入
+  - 修复 `apps/isaac/eval_worker.py` 对空 `value_norm` state 的兼容问题
+  - 串行跑完 `quick` 与 `main` 两套正式评测
+- Files created/modified:
+  - `apps/isaac/eval_worker.py`
+  - `artifacts/eval/pilot_20260327_134032_quick.json`
+  - `artifacts/eval/pilot_20260327_134032_main.json`
+  - `findings.md`
+  - `progress.md`
+- Evaluation summary:
+  - `quick`: `success_rate=0.0`, `collision_rate=0.9167`, `progress_stall_rate=0.9167`, `score=-60.70`
+  - `main`: `success_rate=0.0`, `collision_rate=0.8542`, `progress_stall_rate=0.6875`, `score=-56.81`
+
+## Session: 2026-04-02
+
+### Phase 14: 正式基线对比与阶段封板
+- **Status:** complete
+- Actions taken:
+  - 新增 `src/navrl_dashgo/comparison.py`，把指标对比、终止原因统计、失败模式提炼和 Markdown 报告渲染抽成可复用逻辑
+  - 增强 `tools/compare_models.py`，支持三种输入方式：
+    - 直接传 baseline/candidate checkpoint
+    - 读取已有 baseline/candidate eval JSON
+    - 默认从旧仓库在线 manifest 自动解析 GeoNav 基线 checkpoint
+  - 新增 `tests/test_comparison.py`，对对比逻辑做纯 Python 单测
+  - 跑出旧仓库在线基线 `quick/main` 正式评测：
+    - `artifacts/eval/baseline_model_883_quick.json`
+    - `artifacts/eval/baseline_model_883_main.json`
+  - 产出 quick/main 正式对比 JSON 与 Markdown：
+    - `artifacts/eval/compare_quick_online_vs_navrl.json`
+    - `artifacts/eval/compare_quick_online_vs_navrl.md`
+    - `artifacts/eval/compare_main_online_vs_navrl.json`
+    - `artifacts/eval/compare_main_online_vs_navrl.md`
+  - 补齐阶段文档与边界文档：
+    - `docs/phase1_formal_comparison_2026-04-02.md`
+    - `docs/phase2_real_robot_boundary_2026-04-02.md`
+  - 更新 `README.md / task_plan.md / findings.md / progress.md`，把第一阶段完成定义和第二阶段边界固化
+- Files created/modified:
+  - `src/navrl_dashgo/comparison.py`
+  - `tools/compare_models.py`
+  - `tests/test_comparison.py`
+  - `README.md`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+  - `docs/phase1_formal_comparison_2026-04-02.md`
+  - `docs/phase2_real_robot_boundary_2026-04-02.md`
+
+## Latest Test Results
+| Test | Input | Expected | Actual | Status |
+|------|-------|----------|--------|--------|
+| 对比逻辑单测 | `PYTHONPATH=src python3 -m unittest discover -s tests -v` | 指标对比、终止统计、Markdown 渲染通过 | `4 tests OK` | ✓ |
+| 旧在线基线 quick | `model_883.pt` + `suite=quick` | 产出正式基线 JSON | `success_rate=0.0833, collision_rate=0.0, timeout_rate=0.9167, score=-65.34` | ✓ |
+| 旧在线基线 main | `model_883.pt` + `suite=main` | 产出正式基线 JSON | `success_rate=0.1042, collision_rate=0.0, timeout_rate=0.8958, score=-50.42` | ✓ |
+| quick 正式对比 | baseline online vs `pilot_20260327_134032` | 产出 JSON + Markdown 报告 | 候选未形成成功 episode，但 `score` 高于基线 `+4.6349` | ✓ |
+| main 正式对比 | baseline online vs `pilot_20260327_134032` | 产出 JSON + Markdown 报告 | 候选整体劣于基线，`score` 低于基线 `-6.3903` | ✓ |
+
+### Phase 15: 本机模式摸索与 17 小时自治训练
+- **Status:** in_progress
+- Actions taken:
+  - 在 `src/dashgo_rl/dashgo_env_navrl_official.py` 中落地最小算法修正：
+    - `goal_termination_threshold=0.6`
+    - 新增 `navrl_waypoint_velocity`
+    - 下调 `navrl_survival` 权重
+  - 在 `configs/train/train.yaml` 与 `src/navrl_dashgo/env_adapter.py` 中增加 `env.map_source`
+  - 新增 `tools/benchmark_train_modes.py`，批量跑本机训练模式短跑 benchmark
+  - 新增 `tools/autonomous_training_cycle.py`，把“训练 -> 评测 -> 对比”串成可后台自运行的长期周期
+  - 修复自治链两个问题：
+    - 评测失败时仍要保留 JSON，不应仅凭返回码中断
+    - 训练退出后立刻拉评测会偶发 Isaac `bad_optional_access`，增加冷却与重试
+  - 通过 `1024 frame` 短周期完成一次自治闭环回归
+  - 正式启动 `17` 小时自治训练周期
+- Files created/modified:
+  - `src/dashgo_rl/dashgo_env_navrl_official.py`
+  - `src/navrl_dashgo/env_adapter.py`
+  - `configs/train/train.yaml`
+  - `tools/benchmark_train_modes.py`
+  - `tools/autonomous_training_cycle.py`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+- Runtime facts:
+  - 吞吐摸索代表结果：
+    - `official_e24_camoff -> 445.81 fps`
+    - `official_e64_camoff -> 616.99 fps`
+    - `official_e96_camoff -> 669.73 fps`
+    - `official_e128_camoff -> 725.74 fps`（仅短吞吐探针）
+    - `official_e8_camon -> 217.08 fps`
+  - 正式长跑选择：
+    - `env.num_envs=96`
+    - `env.map_source=dashgo_official`
+    - `enable_cameras=false`
+    - `max_frame_num=165888000`
+  - 当前自治周期：
+    - `cycle_root=/home/gwh/dashgo_navrl_project/artifacts/autonomous/20260402_210824`
+    - `run_root=/home/gwh/dashgo_navrl_project/artifacts/runs/pilot_20260402_210831`
+    - `six_hour_mark_at=2026-04-03T03:08:24+08:00`
+    - `expected_end_at=2026-04-03T14:08:24+08:00`
+- Verification snapshot:
+  - `python3 -m py_compile` 已覆盖新增/修改脚本
+  - `benchmark_train_modes.py` 已实际跑出 benchmark JSON
+  - `autonomous_training_cycle.py` 已通过短周期完整回归
+  - 当前 `ps / status.json / background_train.py status` 三方一致，正式训练进程正在运行
+
+## Latest Error Log
+| Timestamp | Error | Attempt | Resolution |
+|-----------|-------|---------|------------|
+| 2026-04-02 17:17 | `compare_models.py` 只能吃 checkpoint，不能直接复用现有 eval JSON | 1 | 新增 `--baseline-json / --candidate-json / --report-out`，并支持默认在线 manifest 基线 |
+| 2026-04-02 17:20 | 第一阶段缺少“正式基线口径”，无法避免挑模型争议 | 1 | 固定旧仓库在线 TorchScript manifest 指向的 `model_883.pt` 为唯一 GeoNav 基线 |
+| 2026-04-02 21:56 | 当前正式长跑 `frames=6147072` 起持续 `NaN` | 1 | 暂未修复；当前 run 已降级为 debug 样本，下一阶段先修 correctness blocker |
+| 2026-04-02 22:10 | `autonomous_training_cycle.py` 只按 artifact 存在判断评测可用 | 1 | 暂未修复；已在复盘中明确要求加入 payload-level success guard |
+| 2026-04-02 22:14 | `PPO/GAE` 只使用 `terminated`，忽略 `truncated` | 1 | 暂未修复；已升级为下一轮正式训练前的 correctness blocker |
+| 2026-04-02 22:18 | `navrl_upstream` 地图模式与当前 Isaac Lab API 高概率不兼容 | 1 | 暂未修复；已要求至少改成显式报错或先禁用 |
+
+### Phase 16: 长跑复盘与 correctness blocker 收口前准备
+- **Status:** in_progress
+- Actions taken:
+  - 交叉核对外部静态审查 findings、当前 `train.log`、`status.json` 与 benchmark JSON
+  - 确认当前正式长跑在 `frames=6147072` 处进入持续 NaN，已不再适合作为正式结果来源
+  - 明确 checkpoint 处置边界：
+    - `checkpoint_6147072.pt` 及之后视为无效
+    - `checkpoint_4611072.pt` 及之前降级为 pre-fix debug/warm-start 样本
+  - 编写正式复盘文档：
+    - `/home/gwh/文档/Obsidian Vault/03_项目记录/DashGo/DashGo_NavRL_Longrun_Retro_2026-04-02_22-28.md`
+  - 更新 `findings.md / progress.md / task_plan.md`，把阶段判断从“等待收数”改为“先修 correctness blocker”
+- Runtime facts:
+  - 当前 live run 仍在 supervisor 下运行，但其训练有效性已失效
+  - 当前最强证据不是最终分数，而是 NaN 起点与未修 correctness 缺陷
+- Verification snapshot:
+  - `train.log` 已实证 `frames=6147072` 起连续 NaN
+  - `status.json` 已确认当前 run 口径为 `pilot + env.num_envs=96 + dashgo_official + cameras off`
+  - 复盘文档已落盘到 `docs/`
+
+### Phase 17: TorchRL 与评测生命周期修复、记录与复盘
+- **Status:** complete
+- Actions taken:
+  - 修复 `src/navrl_dashgo/env_adapter.py` 的 `_reset()`，避免 TorchRL partial reset 被错误放大成整批 `base_env.reset()`
+  - 为训练侧增加 `_collapse_reset_mask / _resolve_reset_env_ids / _envs_already_autoreset / _current_raw_obs`
+  - 在 `apps/isaac/eval_worker.py` 中新增 `step_env_without_auto_reset()`，让评测循环先读取终态指标，再显式 reset done env
+  - 在 `apps/isaac/eval_worker.py` 中新增 `reset_done_envs_for_next_episode()`，确保 recycle env 在重新布场景后立即刷新观测
+  - 在 `src/dashgo_rl/project_paths.py` 中新增统一的 `resolve_isaac_python()/ISAAC_PYTHON`
+  - 将 `tools/background_train.py`、`tools/benchmark_train_modes.py`、`tools/eval_checkpoint.py` 统一切到项目级 Isaac Python 解析
+  - 为生命周期问题补齐单测：
+    - `tests/test_env_and_ppo_guards.py`
+    - `tests/test_eval_worker_flow.py`
+  - 跑通 smoke 训练与 quick eval smoke，并将本轮修复、验证、复盘写入项目台账与 Obsidian
+- Files created/modified:
+  - `src/navrl_dashgo/env_adapter.py`
+  - `apps/isaac/eval_worker.py`
+  - `src/dashgo_rl/project_paths.py`
+  - `tools/background_train.py`
+  - `tools/benchmark_train_modes.py`
+  - `tools/eval_checkpoint.py`
+  - `tests/test_env_and_ppo_guards.py`
+  - `tests/test_eval_worker_flow.py`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+- Verification snapshot:
+  - `PYTHONPATH=src:. /home/gwh/IsaacLab/_isaac_sim/python.sh -m unittest tests.test_env_and_ppo_guards tests.test_eval_worker_flow -q`
+    - `11` 项通过
+  - `PYTHONPATH=src:. /home/gwh/IsaacLab/_isaac_sim/python.sh -m unittest discover -s tests -q`
+    - `28` 项通过
+  - `/home/gwh/IsaacLab/_isaac_sim/python.sh -m py_compile src/navrl_dashgo/env_adapter.py apps/isaac/eval_worker.py tools/eval_checkpoint.py tools/background_train.py tools/benchmark_train_modes.py tests/test_env_and_ppo_guards.py tests/test_eval_worker_flow.py`
+    - 通过
+  - smoke 训练：
+    - `/home/gwh/IsaacLab/_isaac_sim/python.sh apps/isaac/train_navrl.py --headless profiles=smoke max_frame_num=64 env.num_envs=2 save_interval_batches=9999 logging.print_interval_batches=1`
+    - 成功产出 `/home/gwh/dashgo_navrl_project/artifacts/runs/smoke_20260402_235946/checkpoints/checkpoint_final.pt`
+  - quick eval smoke：
+    - `/home/gwh/IsaacLab/_isaac_sim/python.sh tools/eval_checkpoint.py --checkpoint /home/gwh/dashgo_navrl_project/artifacts/runs/smoke_20260402_235946/checkpoints/checkpoint_final.pt --suite quick --requested-episodes 2 --json-out /tmp/dashgo_navrl_eval_smoke_20260402.json`
+    - 成功产出结构化 JSON；退出码来自 `behavior_gate_veto`，不是 worker 生命周期故障
+
+## Latest Test Results
+| Test | Input | Expected | Actual | Status |
+|------|-------|----------|--------|--------|
+| partial reset 回归 | `tests.test_env_and_ppo_guards` | 只 reset 目标 env，已 auto-reset 时复用当前 obs | `7 tests OK` | ✓ |
+| eval worker 生命周期回归 | `tests.test_eval_worker_flow` | 保留终态统计时机，并在 recycle 后刷新 obs | `4 tests OK` | ✓ |
+| 全量单测回归 | `unittest discover -s tests -q` | 本轮修复不破坏既有单测 | `28 tests OK` | ✓ |
+| smoke 训练 | `profiles=smoke max_frame_num=64 env.num_envs=2` | 完成 1 batch 并产出 final checkpoint | `checkpoint_final.pt` 已生成 | ✓ |
+| quick eval smoke | `suite=quick requested_episodes=2` | 评测链路可完整产出 JSON | 已产出 `/tmp/dashgo_navrl_eval_smoke_20260402.json`；失败原因是行为 gate 而非执行崩溃 | ✓ |
+
+## Latest Error Log
+| Timestamp | Error | Attempt | Resolution |
+|-----------|-------|---------|------------|
+| 2026-04-02 | `TorchRLDashgoEnv._reset()` 忽略 TorchRL partial reset，单个 done env 触发整批二次 reset | 1 | 已修复；按 `_reset` 掩码只处理目标 env，且识别 Isaac Lab auto-reset 后优先复用当前 obs |
+| 2026-04-02 | `eval_worker.py` 在 `step()` 之后统计终态，读到 reset 后状态 | 1 | 已修复；引入显式 `step_env_without_auto_reset()` 并把 reset 延后到统计完成之后 |
+| 2026-04-03 | quick eval smoke 返回 `status=failed` | 1 | 已确认是 `behavior_gate_veto`，不是生命周期链路再次崩溃 |
+
+### Phase 18: 12 小时 formal 连续训练启动
+- **Status:** in_progress
+- Actions taken:
+  - 核对 `formal / main / smoke / pilot` 四个 supervisor 状态，确认：
+    - `formal=idle`
+    - `main=idle`
+    - `smoke=completed`
+    - `pilot=abandoned`
+  - 核对当前没有活动中的 `/home/gwh/dashgo_navrl_project/apps/isaac/train_navrl.py` 进程
+  - 复核 `formal` 配置：
+    - `env.num_envs=96`
+    - `env.map_source=dashgo_official`
+    - `enable_cameras=false`
+    - `training_frame_num=32`
+  - 按最近 benchmark `669.73 fps` 计算 12 小时预算，并对齐到 `frames_per_batch=3072`
+  - 建立 Obsidian 正式执行记录：
+    - `/home/gwh/文档/Obsidian Vault/03_项目记录/DashGo/dashgo_navrl_project_12h_formal_training_2026-04-03.md`
+  - 记录用户新增要求：本仓库代码后续需要上传 GitHub
+  - 启动后台训练：
+    - `python3 tools/background_train.py start --profile formal max_frame_num=28932096`
+- Runtime facts:
+  - `started_at=2026-04-03T00:11:49+08:00`
+  - `expected_end_at=2026-04-03 12:10:22 +0800`
+  - `pid=40361`
+  - `attempt_id=20260403_001149`
+  - `started_command_hash=b9f64135c9e9989d5b7169ef499c57246d1a3c4d03aeacf44b8785a0803f3dcc`
+  - `run_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_001157`
+  - `tensorboard_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_001157/logs/tensorboard`
+  - `frames_per_batch=3072`
+  - `total_frames=28932096`
+- Verification snapshot:
+  - supervisor 当前为 `running`
+  - 日志已出现：
+    - `run_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_001157`
+    - `tensorboard_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_001157/logs/tensorboard`
+    - `batch=0 frames=3072 actor_loss=0.0002 critic_loss=0.4831 entropy=0.0002 explained_var=0.0591`
+    - `checkpoint=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_001157/checkpoints/checkpoint_3072.pt`

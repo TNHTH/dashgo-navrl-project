@@ -63,6 +63,39 @@ def resolve_total_episodes(suite: str, requested_episodes: int | None) -> int:
     return int(requested_episodes or defaults[suite])
 
 
+def step_env_without_auto_reset(env, action: torch.Tensor):
+    """复刻 Isaac Lab step 主流程，但把 reset 留给评测循环显式控制。"""
+    env.action_manager.process_action(action.to(env.device))
+    env.recorder_manager.record_pre_step()
+
+    is_rendering = env.sim.has_gui() or env.sim.has_rtx_sensors()
+    for _ in range(env.cfg.decimation):
+        env._sim_step_counter += 1
+        env.action_manager.apply_action()
+        env.scene.write_data_to_sim()
+        env.sim.step(render=False)
+        if env._sim_step_counter % env.cfg.sim.render_interval == 0 and is_rendering:
+            env.sim.render()
+        env.scene.update(dt=env.physics_dt)
+
+    env.episode_length_buf += 1
+    env.common_step_counter += 1
+    env.reset_buf = env.termination_manager.compute()
+    env.reset_terminated = env.termination_manager.terminated.clone()
+    env.reset_time_outs = env.termination_manager.time_outs.clone()
+    env.reward_buf = env.reward_manager.compute(dt=env.step_dt)
+
+    if len(env.recorder_manager.active_terms) > 0:
+        env.obs_buf = env.observation_manager.compute()
+        env.recorder_manager.record_post_step()
+
+    env.command_manager.compute(dt=env.step_dt)
+    if "interval" in env.event_manager.available_modes:
+        env.event_manager.apply(mode="interval", dt=env.step_dt)
+    env.obs_buf = env.observation_manager.compute()
+    return env.obs_buf, env.reward_buf, env.reset_terminated, env.reset_time_outs, env.extras
+
+
 def set_robot_state(env, env_ids: torch.Tensor, yaw: torch.Tensor) -> None:
     from dashgo_rl.dashgo_env_navrl_official import quat_from_euler_xyz
 
@@ -141,6 +174,18 @@ def initialize_episode_state(env, env_ids: torch.Tensor, scenarios: list[dict], 
     return next_scene_idx
 
 
+def reset_done_envs_for_next_episode(
+    env,
+    done_ids: torch.Tensor,
+    scenarios: list[dict],
+    next_scene_idx: int,
+    stats: dict,
+) -> tuple[int, dict]:
+    env.reset(env_ids=done_ids)
+    next_scene_idx = initialize_episode_state(env, done_ids, scenarios, next_scene_idx, stats)
+    return next_scene_idx, env.observation_manager.compute()
+
+
 def finalize_episode(env, env_id: int, stat: dict, reason: str) -> dict:
     from dashgo_rl.dashgo_env_navrl_official import _get_target_delta_and_heading
     from isaaclab.managers import SceneEntityCfg
@@ -210,7 +255,11 @@ def load_algo_checkpoint(algo: torch.nn.Module, payload: dict) -> list[str]:
         algo.critic.load_state_dict(inference_state["critic"], strict=True)
         value_norm_state = inference_state.get("value_norm")
         if isinstance(value_norm_state, dict):
-            algo.value_norm.load_state_dict(value_norm_state, strict=True)
+            load_result = algo.value_norm.load_state_dict(value_norm_state, strict=False)
+            if load_result.missing_keys:
+                notes.append(f"value_norm_missing_keys={load_result.missing_keys}")
+            if load_result.unexpected_keys:
+                notes.append(f"value_norm_unexpected_keys={load_result.unexpected_keys}")
         return notes
 
     state_dict = payload["model_state_dict"] if isinstance(payload, dict) and "model_state_dict" in payload else payload
@@ -281,12 +330,8 @@ def main() -> int:
             with set_exploration_type(ExplorationType.MEAN), torch.no_grad():
                 algo(td)
             action = td["agents", "action"].squeeze(1)
-            step_ret = env.step(action)
-            if len(step_ret) == 5:
-                raw_obs, _, terminated, truncated, _ = step_ret
-                dones = terminated | truncated
-            else:
-                raw_obs, _, dones, _ = step_ret
+            raw_obs, _, terminated, truncated, _ = step_env_without_auto_reset(env, action)
+            dones = terminated | truncated
 
             min_obstacle = _get_min_obstacle_distance(env)
             lidar = process_stitched_lidar(env)
@@ -352,7 +397,13 @@ def main() -> int:
                     break
             remaining_ids = done_ids[: max(0, min(done_ids.numel(), total_episodes - len(episodes)))]
             if remaining_ids.numel() > 0 and len(episodes) < total_episodes:
-                next_scene_idx = initialize_episode_state(env, remaining_ids, scenarios, next_scene_idx, active_stats)
+                next_scene_idx, raw_obs = reset_done_envs_for_next_episode(
+                    env,
+                    remaining_ids,
+                    scenarios,
+                    next_scene_idx,
+                    active_stats,
+                )
 
         metrics = summarize_eval_episodes(episodes, suite=args_cli.suite)
         violations = behavior_gate_violations(metrics, suite=args_cli.suite)

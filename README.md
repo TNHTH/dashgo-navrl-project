@@ -11,6 +11,18 @@
 - 用统一的 DashGo quick/main 评测协议，对比旧仓库模型与新仓库模型。
 - 第一阶段只做训练与仿真评测，不接 ROS2/TorchScript 部署链路。
 
+## 当前状态
+
+- 2026-04-02 已完成第一阶段仿真闭环、正式 quick/main 评测和基线对比。
+- 旧仓库基线固定为当前在线 manifest 指向的 GeoNav checkpoint：
+  - `/home/gwh/dashgo_rl_project/workspaces/ros2_ws/src/dashgo_rl_ros2/models/policy_torchscript.manifest.json`
+- 候选模型当前使用：
+  - `/home/gwh/dashgo_navrl_project/artifacts/runs/pilot_20260327_134032/checkpoints/checkpoint_2765056.pt`
+- 第一阶段结论：
+  - `quick` 下候选没有形成成功 episode，但因为旧在线基线严重 timeout/绕圈，候选 `score` 略高于基线。
+  - `main` 下候选整体劣于基线，主要问题是碰撞占主导。
+  - 两边都未通过行为 gate，因此当前不是“NavRL-style 已经优于主线”，而是“仿真复现已收口，但候选尚未达到可替代基线的水平”。
+
 ## 仓库边界
 
 - 上游只读参考: `/home/gwh/NavRL_upstream`
@@ -71,11 +83,29 @@ python3 tools/background_train.py stop --profile smoke
 
 ```bash
 python3 tools/eval_checkpoint.py --checkpoint artifacts/runs/<run>/checkpoints/checkpoint_final.pt --suite quick
-python3 tools/compare_models.py --baseline-checkpoint /path/to/old.pt --candidate-checkpoint /path/to/new.pt
+python3 tools/compare_models.py --candidate-checkpoint /path/to/new.pt --suite quick
+python3 tools/compare_models.py \
+  --suite quick \
+  --candidate-json artifacts/eval/pilot_20260327_134032_quick.json \
+  --json-out artifacts/eval/compare_quick_online_vs_navrl.json \
+  --report-out artifacts/eval/compare_quick_online_vs_navrl.md
 ```
+
+- `tools/compare_models.py` 默认会从旧仓库在线 manifest 解析 GeoNav 基线 checkpoint。
+- 若已经有现成评测 JSON，可直接用 `--baseline-json` 或 `--candidate-json` 跳过重复评测。
+- 当前正式产物：
+  - `artifacts/eval/baseline_model_883_quick.json`
+  - `artifacts/eval/baseline_model_883_main.json`
+  - `artifacts/eval/compare_quick_online_vs_navrl.json`
+  - `artifacts/eval/compare_quick_online_vs_navrl.md`
+  - `artifacts/eval/compare_main_online_vs_navrl.json`
+  - `artifacts/eval/compare_main_online_vs_navrl.md`
+  - `docs/phase1_formal_comparison_2026-04-02.md`
+  - `docs/phase2_real_robot_boundary_2026-04-02.md`
 
 ## 说明
 
 - 旧仓库完全不改，这里只复用其参数来源和环境设计。
 - 当前版本优先保证闭环可跑和对比协议一致，再继续加深动态障碍密度与训练规模。
 - 在 RTX 4060 8GB 上，不建议在训练进行中并发启动第二个 Isaac 实例做评测；`tools/eval_checkpoint.py` 默认会拦截这种并发。
+- 第二阶段默认不直接移植上游 `onboard_detector + safe_action`，而是为 DashGo 设计激光雷达/差速友好的动态障碍表示与安全接口。
