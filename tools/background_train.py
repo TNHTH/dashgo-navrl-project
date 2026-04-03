@@ -79,6 +79,14 @@ def _command_hash(command: list[str]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _extract_override_value(overrides: list[str], key: str) -> str | None:
+    prefix = f"{key}="
+    for item in overrides:
+        if item.startswith(prefix):
+            return item.split("=", 1)[1].strip()
+    return None
+
+
 def _write_run_status_record(run_root_value: str | None, payload: dict[str, Any]) -> None:
     if not run_root_value:
         return
@@ -241,6 +249,7 @@ def start_training(profile: str, overrides: list[str]) -> dict[str, Any]:
     command.extend(overrides)
     attempt_id = now_slug()
     command_hash = _command_hash(command)
+    resume_from = _extract_override_value(overrides, "resume_from")
 
     with log_path(profile).open("ab") as log_handle:
         start_marker = (
@@ -271,7 +280,7 @@ def start_training(profile: str, overrides: list[str]) -> dict[str, Any]:
             "desired_state": "running",
             "pause_scope": "none",
             "next_action": "poll_status",
-            "resume_from": None,
+            "resume_from": resume_from,
             "started_at": now_iso(),
             "command": command,
             "attempt_id": attempt_id,

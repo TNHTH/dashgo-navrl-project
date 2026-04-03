@@ -9,6 +9,8 @@ device: cuda:0
 headless: true
 enable_cameras: false
 max_frame_num: 100000
+resume_from: null
+resume_optimizer_state: false
 eval_interval_batches: 25
 save_interval_batches: 25
 

@@ -78,6 +78,13 @@ def main() -> int:
         from torchrl.collectors import SyncDataCollector
         from torchrl.envs.utils import ExplorationType
 
+        from navrl_dashgo.checkpointing import (
+            build_checkpoint_payload,
+            load_checkpoint_payload,
+            load_training_checkpoint,
+            resolve_frame_count,
+            resolve_remaining_frames,
+        )
         from navrl_dashgo.env_adapter import TorchRLDashgoEnv
         from navrl_dashgo.ppo import NonFiniteTrainingStateError, PPO
         from navrl_dashgo.runtime import build_run_layout, write_json
@@ -85,6 +92,13 @@ def main() -> int:
         cfg.headless = resolved_headless
         cfg.enable_cameras = resolved_enable_cameras
         cfg.env.map_source = str(getattr(cfg.env, "map_source", "dashgo_official")).strip().lower()
+        resume_optimizer_state = bool(getattr(cfg, "resume_optimizer_state", False))
+        resume_from_value = getattr(cfg, "resume_from", None)
+        resume_checkpoint = None
+        if resume_from_value not in (None, "", "null"):
+            resume_checkpoint = Path(str(resume_from_value)).expanduser().resolve()
+            if not resume_checkpoint.exists():
+                raise FileNotFoundError(f"resume_from 指向的 checkpoint 不存在: {resume_checkpoint}")
 
         print(
             "[DashGo-NavRL] resolved_config "
@@ -96,12 +110,35 @@ def main() -> int:
         env = TorchRLDashgoEnv(cfg)
         algo = PPO(cfg.algo, env.observation_spec, env.agent_action_spec, env.device)
         algo.train()
+        resume_notes: list[str] = []
+        start_frame_count = 0
+        if resume_checkpoint is not None:
+            resume_payload = load_checkpoint_payload(resume_checkpoint, map_location=env.device)
+            resume_notes = load_training_checkpoint(
+                algo,
+                resume_payload,
+                load_optimizer_state=resume_optimizer_state,
+            )
+            start_frame_count = resolve_frame_count(resume_payload)
 
         layout = build_run_layout(str(cfg.profile))
         write_json(layout.config_snapshot, OmegaConf.to_container(cfg, resolve=True))
+        if resume_checkpoint is not None:
+            write_json(
+                layout.run_root / "resume_state.json",
+                {
+                    "resume_from": str(resume_checkpoint),
+                    "resume_optimizer_state": resume_optimizer_state,
+                    "start_frame_count": start_frame_count,
+                    "resume_notes": resume_notes,
+                },
+            )
         tb_writer = SummaryWriter(log_dir=str(layout.tensorboard_root), flush_secs=30, max_queue=20)
         tb_writer.add_text("run/profile", str(cfg.profile), 0)
         tb_writer.add_text("run/config_yaml", OmegaConf.to_yaml(cfg), 0)
+        if resume_checkpoint is not None:
+            tb_writer.add_text("run/resume_from", str(resume_checkpoint), start_frame_count)
+            tb_writer.add_text("run/resume_notes", "\n".join(resume_notes) or "none", start_frame_count)
 
         wandb_run = None
         if str(cfg.wandb.mode).lower() != "disabled":
@@ -116,11 +153,18 @@ def main() -> int:
             )
 
         frames_per_batch = int(cfg.env.num_envs) * int(cfg.algo.training_frame_num)
+        target_frame_count = int(cfg.max_frame_num)
+        collector_total_frames = (
+            resolve_remaining_frames(target_frame_count, start_frame_count)
+            if resume_checkpoint is not None
+            else target_frame_count
+        )
+        starting_batch_idx = start_frame_count // frames_per_batch
         collector = SyncDataCollector(
             env,
             policy=algo,
             frames_per_batch=frames_per_batch,
-            total_frames=int(cfg.max_frame_num),
+            total_frames=collector_total_frames,
             device=env.device,
             storing_device=env.device,
             policy_device=env.device,
@@ -133,18 +177,12 @@ def main() -> int:
         def save_checkpoint(tag: str, frame_count: int) -> Path:
             checkpoint_path = layout.checkpoint_root / f"{tag}.pt"
             torch.save(
-                {
-                    "model_state_dict": algo.state_dict(),
-                    "inference_state_dict": {
-                        "feature_extractor": algo.feature_extractor.state_dict(),
-                        "actor": algo.actor.state_dict(),
-                        "critic": algo.critic.state_dict(),
-                        "value_norm": algo.value_norm.state_dict(),
-                    },
-                    "config": OmegaConf.to_container(cfg, resolve=True),
-                    "frame_count": frame_count,
-                    "profile": str(cfg.profile),
-                },
+                build_checkpoint_payload(
+                    algo,
+                    config=OmegaConf.to_container(cfg, resolve=True),
+                    frame_count=frame_count,
+                    profile=str(cfg.profile),
+                ),
                 checkpoint_path,
             )
             return checkpoint_path
@@ -153,42 +191,52 @@ def main() -> int:
         print(f"[DashGo-NavRL] tensorboard_root={layout.tensorboard_root}", flush=True)
         print(
             f"[DashGo-NavRL] profile={cfg.profile} num_envs={cfg.env.num_envs} "
-            f"frames_per_batch={frames_per_batch} total_frames={cfg.max_frame_num}",
+            f"frames_per_batch={frames_per_batch} total_frames={target_frame_count}",
             flush=True,
         )
+        if resume_checkpoint is not None:
+            print(
+                f"[DashGo-NavRL] resume_from={resume_checkpoint} start_frame_count={start_frame_count} "
+                f"remaining_frames={collector_total_frames} "
+                f"resume_optimizer_state={resume_optimizer_state}",
+                flush=True,
+            )
+            if resume_notes:
+                print(f"[DashGo-NavRL] resume_notes={' | '.join(resume_notes)}", flush=True)
 
         for batch_idx, data in enumerate(collector):
+            global_batch_idx = starting_batch_idx + batch_idx
             stats = algo.update(data)
-            frame_count = int((batch_idx + 1) * frames_per_batch)
+            frame_count = start_frame_count + int((batch_idx + 1) * frames_per_batch)
             stats["env_frames"] = frame_count
-            stats["batch_idx"] = batch_idx
+            stats["batch_idx"] = global_batch_idx
 
             tb_writer.add_scalar("train/actor_loss", float(stats["actor_loss"]), frame_count)
             tb_writer.add_scalar("train/critic_loss", float(stats["critic_loss"]), frame_count)
             tb_writer.add_scalar("train/entropy", float(stats["entropy"]), frame_count)
             tb_writer.add_scalar("train/explained_var", float(stats["explained_var"]), frame_count)
-            tb_writer.add_scalar("train/batch_idx", float(batch_idx), frame_count)
+            tb_writer.add_scalar("train/batch_idx", float(global_batch_idx), frame_count)
             tb_writer.add_scalar("train/num_envs", float(cfg.env.num_envs), frame_count)
             tb_writer.add_scalar("train/static_obstacles", float(cfg.env.static_obstacles), frame_count)
             tb_writer.add_scalar("train/dynamic_obstacles", float(cfg.env.dynamic_obstacles), frame_count)
 
-            if batch_idx % int(cfg.logging.print_interval_batches) == 0:
+            if global_batch_idx % int(cfg.logging.print_interval_batches) == 0:
                 print(
-                    f"[DashGo-NavRL] batch={batch_idx} frames={frame_count} "
+                    f"[DashGo-NavRL] batch={global_batch_idx} frames={frame_count} "
                     f"actor_loss={stats['actor_loss']:.4f} critic_loss={stats['critic_loss']:.4f} "
                     f"entropy={stats['entropy']:.4f} explained_var={stats['explained_var']:.4f}",
                     flush=True,
                 )
-            if batch_idx % int(cfg.save_interval_batches) == 0:
+            if global_batch_idx % int(cfg.save_interval_batches) == 0:
                 checkpoint = save_checkpoint(f"checkpoint_{frame_count}", frame_count)
                 print(f"[DashGo-NavRL] checkpoint={checkpoint}", flush=True)
                 tb_writer.flush()
             if wandb_run is not None:
                 wandb_run.log(stats)
 
-        final_checkpoint = save_checkpoint("checkpoint_final", int(cfg.max_frame_num))
+        final_checkpoint = save_checkpoint("checkpoint_final", target_frame_count)
         print(f"[DashGo-NavRL] final_checkpoint={final_checkpoint}", flush=True)
-        tb_writer.add_text("run/final_checkpoint", str(final_checkpoint), int(cfg.max_frame_num))
+        tb_writer.add_text("run/final_checkpoint", str(final_checkpoint), target_frame_count)
         tb_writer.flush()
         tb_writer.close()
 
