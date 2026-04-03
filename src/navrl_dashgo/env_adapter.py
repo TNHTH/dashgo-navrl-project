@@ -24,7 +24,7 @@ POLICY_OBS_DIM = 246
 LIDAR_HISTORY_DIM = 216
 LIDAR_SECTORS = 72
 LIDAR_HISTORY = 3
-STATE_DIM = 8
+STATE_DIM = POLICY_OBS_DIM - LIDAR_HISTORY_DIM
 MAX_DYNAMIC_OBS = 5
 DYNAMIC_TOKEN_DIM = 10
 ALLOWED_MAP_SOURCES = {"dashgo_official", "navrl_upstream"}
@@ -75,6 +75,15 @@ class ObservationSlices:
     yaw_rate_end: int = 240
     last_action_end: int = 246
 
+
+def build_state_observation(policy_obs: torch.Tensor, slices: ObservationSlices | None = None) -> torch.Tensor:
+    """恢复 LiDAR 之外的完整策略状态，避免在适配层丢失时序信息。"""
+    active_slices = slices or ObservationSlices()
+    state = policy_obs[:, active_slices.lidar_end : active_slices.last_action_end]
+    if state.shape[-1] != STATE_DIM:
+        raise ValueError(f"意外的 DashGo state 观测维度: {state.shape}")
+    return state
+
 class DashgoTensorAdapter:
     def __init__(self, env) -> None:
         self.env = env
@@ -94,28 +103,7 @@ class DashgoTensorAdapter:
             history_length=LIDAR_HISTORY,
             num_sectors=LIDAR_SECTORS,
         )
-        waypoint_hist = restore_flat_history(
-            policy_obs[:, self.slices.lidar_end : self.slices.waypoint_end],
-            history_length=LIDAR_HISTORY,
-            feature_dim=3,
-        )
-        goal_hist = restore_flat_history(
-            policy_obs[:, self.slices.waypoint_end : self.slices.goal_end],
-            history_length=LIDAR_HISTORY,
-            feature_dim=3,
-        )
-        lin_vel_hist = policy_obs[:, self.slices.goal_end : self.slices.lin_vel_end]
-        yaw_rate_hist = policy_obs[:, self.slices.lin_vel_end : self.slices.yaw_rate_end]
-
-        state = torch.cat(
-            [
-                waypoint_hist[:, -1, :],
-                goal_hist[:, -1, :],
-                lin_vel_hist[:, -1:].clone(),
-                yaw_rate_hist[:, -1:].clone(),
-            ],
-            dim=-1,
-        ).reshape(num_envs, 1, STATE_DIM)
+        state = build_state_observation(policy_obs, self.slices).reshape(num_envs, 1, STATE_DIM).clone()
 
         dynamic_obstacle = self._build_dynamic_obstacle_tokens().reshape(num_envs, 1, MAX_DYNAMIC_OBS, DYNAMIC_TOKEN_DIM)
 

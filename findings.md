@@ -363,3 +363,209 @@
 - 目前判断：
   - 原先 `96 env` 不再是最优配置
   - 在已测集合里，`256 env` 同时给出了最高吞吐和接近满载的 GPU 利用率
+
+## 2026-04-03 Additional Findings: 接续训练能力已打通，但默认走稳定优先兼容模式
+- 已完成训练链路改造：
+  - `configs/train/train.yaml` 新增 `resume_from: null` 与 `resume_optimizer_state: false`
+  - `src/navrl_dashgo/checkpointing.py` 统一 checkpoint 读写、`frame_count` 解析与恢复逻辑
+  - `apps/isaac/train_navrl.py` 现在可从现有 checkpoint 恢复，并按累计 `max_frame_num` 继续训练
+  - `tools/background_train.py` 现在会把 `resume_from=` 覆盖写入 supervisor 状态
+- 新 checkpoint 现在会额外保存：
+  - `optimizer_state_dict`
+  - `checkpoint_version=2`
+- 旧 checkpoint 兼容续训已经过真实验证：
+  - 从 `/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_003355/checkpoints/checkpoint_final.pt`
+  - 成功续到 `/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_095758/checkpoints/checkpoint_final.pt`
+  - 之后又成功续到 `/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100241/checkpoints/checkpoint_final.pt`
+- 当前重要边界：
+  - 当从新格式 checkpoint 恢复并启用优化器状态时，正式长窗口 run 在首个 update 阶段触发 `CUDA error: an illegal instruction was encountered`
+  - 失败 run：
+    - `/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100010`
+  - 从日志看，触发点在 `ppo.py -> ensure_finite_module_grads()` 之前后，底层伴随 PhysX Fabric/Tensors 的 CUDA illegal instruction
+- 因此本轮采取的稳定策略是：
+  - 默认 `resume_optimizer_state=false`
+  - 恢复模型参数、`value_norm` 与 `frame_count`
+  - 保留优化器状态保存能力，但不默认加载
+- 当前 live formal 续训：
+  - `run_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100334`
+  - `resume_from=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100241/checkpoints/checkpoint_final.pt`
+  - `env.num_envs=256`
+  - `save_interval_batches=50`
+  - `logging.print_interval_batches=50`
+  - 已实证进入持续训练节奏，并生成中间 checkpoint
+- 当前 watchdog 已独立存活：
+  - `pid=11411`
+  - 日志：
+    - `/home/gwh/dashgo_navrl_project/artifacts/supervisor/formal/watchdog_resume_until_20260403_131000.log`
+  - 目标停机时间：
+    - `2026-04-03 13:10:00 +0800`
+
+## 2026-04-03 Additional Findings: 当前暂停点的仿真效果仍不合格
+- 已按用户要求暂停当前续训：
+  - `run_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100334`
+  - 当前最新可评测 checkpoint：
+    - `/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100334/checkpoints/checkpoint_242491392.pt`
+- `quick` 评测结果：
+  - JSON：
+    - `/home/gwh/dashgo_navrl_project/artifacts/eval/candidate_checkpoint_242491392_quick.json`
+  - 结论：
+    - `success_rate=0.0`
+    - `collision_rate=0.8333`
+    - `timeout_rate=0.1667`
+    - `progress_stall_rate=0.6667`
+    - `path_efficiency=0.1015`
+  - 行为 gate 直接否决：
+    - `success_rate<0.75`
+    - `collision_rate>0.10`
+    - `progress_stall_rate>0.25`
+- `main` 评测结果：
+  - JSON：
+    - `/home/gwh/dashgo_navrl_project/artifacts/eval/candidate_checkpoint_242491392_main.json`
+  - 结论：
+    - `success_rate=0.0`
+    - `collision_rate=0.875`
+    - `hard_stop_rate=0.875`
+    - `timeout_rate=0.125`
+    - `progress_stall_rate=0.7292`
+    - `path_efficiency=0.0963`
+  - 行为 gate 直接否决：
+    - `success_rate<0.85`
+    - `collision_rate>0.05`
+    - `hard_stop_rate>0.05`
+    - `progress_stall_rate>0.20`
+- 与 baseline 对比：
+  - quick 对比：
+    - `/home/gwh/dashgo_navrl_project/artifacts/eval/compare_quick_checkpoint_242491392.json`
+  - main 对比：
+    - `/home/gwh/dashgo_navrl_project/artifacts/eval/compare_main_checkpoint_242491392.json`
+  - 虽然 `score` 数值看起来比 baseline 略高，但这是因为当前策略更倾向于“更快撞上或更早结束”，不是更好的导航行为
+- 结构性问题很清楚：
+  - 正向场景不是完全不动，能推进一点，但大多数以碰撞收场
+  - 倒车场景几乎完全不会处理
+    - quick：`reverse_case` 平均 `path_efficiency=0.0`
+    - main：`reverse_case` 平均 `path_efficiency≈0`
+  - 因此“仿真效果怎么样”的当前直接结论是：
+    - 还不行
+    - 模型尚未具备可接受的局部避障导航表现
+
+## 2026-04-03 Additional Findings: 为什么当前效果比旧 DashGo 更差
+- 当前退化不是评测链路假象，主要是训练目标、观测合同和训练分布一起把策略推向了“会朝目标移动，但不会安全收尾，也不会倒车脱困”。
+- 当前正式训练主链使用的是 `env_adapter -> dashgo_env_navrl_official.py`：
+  - `src/navrl_dashgo/env_adapter.py`
+  - `src/dashgo_rl/dashgo_env_navrl_official.py`
+  - 因此真正生效的是 `official` 这条极简 NavRL 奖励线，而不是旧 `dashgo_env_v2.py` 中那套更厚的 DashGo shaping。
+- 第一条根因：成功判据和训练目标没有对齐，导致“安全完成”没有被强力奖励。
+  - 当前 `official` 环境只有：
+    - `survival`
+    - `goal_velocity`
+    - `waypoint_velocity`
+    - `static_safety`
+    - `dynamic_safety`
+    - `twist_smoothness`
+    - `progress_stall`
+    - `orbit`
+  - 参考：
+    - `src/dashgo_rl/dashgo_env_navrl_official.py`
+  - 当前成功条件仍要求：
+    - 到达目标距离阈值内
+    - 且速度低于 `goal_stop_velocity`
+  - 但 `official` 奖励里没有旧 DashGo 那种“大终点奖”。
+  - 旧仓库则明确保留了：
+    - `reach_goal` 奖励 `80.0`
+    - `shaping_distance`
+    - `target_speed`
+    - `facing_goal`
+    - `obstacle_proximity`
+    - `reverse_escape`
+  - 参考：
+    - `src/dashgo_rl/dashgo_env_v2.py`
+  - 这意味着当前策略只需要“持续向目标方向赚过程分”，却没有足够强的动机去学“最后 0.6m 内减速、停稳、避碰完成”。
+- 第二条根因：新训练栈把旧 `246` 维观测压缩得过狠，丢掉了对局部机动很关键的时间信息。
+  - 旧观测合同是：
+    - `72 x 3` LiDAR 历史
+    - `waypoint_vector_history`
+    - `goal_vector_history`
+    - `lin_vel_x_history`
+    - `yaw_rate_history`
+    - `last_action_history`
+  - 参考：
+    - `src/dashgo_rl/observation_contract.py`
+  - 旧 `GeoNavPolicy` 直接按完整 `246` 维输入建模，状态部分实际是 `30` 维：
+    - `src/dashgo_rl/geo_nav_policy.py`
+  - 当前 `env_adapter` 虽然从 `246` 维里恢复出三路输入，但只保留了：
+    - 最新一帧 `waypoint`
+    - 最新一帧 `goal`
+    - 最新一帧 `lin_vel`
+    - 最新一帧 `yaw_rate`
+  - 并且直接丢掉了 `last_action_history`。
+  - 参考：
+    - `src/navrl_dashgo/env_adapter.py`
+  - 结果是：
+    - 旧策略能看到短时运动历史和动作惯性
+    - 新策略的 `state` 只剩 `8` 维，倒车、贴障修正、停稳收尾这些依赖时序上下文的动作更容易学坏
+- 第三条根因：当前 `official` 训练分布没有覆盖“前堵后通”的倒车脱困语义，reverse case 基本没被专项教过。
+  - 当前 `official` 目标采样只是：
+    - 半径 `1.0~4.0m`
+    - 方位 `[-pi, pi]` 均匀采样
+  - 参考：
+    - `src/dashgo_rl/dashgo_env_navrl_official.py`
+  - 它没有旧仓库那种：
+    - 显式 `35%` 后向目标采样
+    - `RECOVERY_SCENARIO_CONFIG`
+    - “前方堵塞、后方通畅、推进停滞”上下文下的 `reverse_escape` shaping
+  - 参考：
+    - `src/dashgo_rl/dashgo_env_v2.py`
+    - `autopilot/findings.md`
+  - 旧仓库历史记录已经给出证据：
+    - 当 `DASHGO_REVERSE_ESCAPE_WEIGHT=0.25` 时，latest 从 `collision` 主导转成了 `time_out=1.0 / collision=0.0`
+  - 当前 checkpoint 的 reverse case 表现也和这个缺口完全一致：
+    - `quick` reverse：平均 `path_efficiency=0.0`
+    - `main` reverse：`collision_rate=0.9565`，平均 `path_efficiency≈0`
+- 第四条根因：如果你拿它和旧 `dashgo` 全系统比，现在本来就不是同一口径。
+  - 旧 `dashgo` ROS2 控制链在策略之外还叠了：
+    - `heading_guard`
+    - `turn_in_place`
+    - `recovery`
+    - `safety_filter`
+  - 参考：
+    - `workspaces/ros2_ws/src/dashgo_rl_ros2/dashgo_rl_ros2/geo_nav_node.py`
+  - 当前 `navrl` 仿真评测没有接这些外层守护，甚至评测结果里的：
+    - `heading_guard_trigger_rate`
+    - `recovery_trigger_rate`
+    - `plan_invalid_ratio`
+    - 都是固定填 `0.0`
+  - 参考：
+    - `apps/isaac/eval_worker.py`
+  - 所以如果你说的是“比旧 DashGo 实际系统更差”，答案是肯定的，因为现在测的是裸 PPO 局部策略，不是“RL + 规则守护 + 恢复控制”的完整系统。
+- 当前最重要的判断：
+  - 相比旧 baseline，当前策略不是“不会动”，而是“更敢动、更容易撞”。
+  - 旧 baseline 更偏 `timeout/stall`，当前 checkpoint 更偏 `collision/hard_stop`。
+  - 这说明当前主问题不是优化没收敛，而是优化方向本身把策略推向了错误行为模式。
+
+## 2026-04-03 Additional Findings: 保留 NavRL 主体后的最小修正集
+- 本轮修正不回退到旧 DashGo 全量 shaping，而是保留 NavRL 的三路输入和“速度/安全主导”的主体结构，只修已坐实的适配偏差。
+- 与 upstream `https://github.com/Zhefan-Xu/NavRL` 对照后的直接结论：
+  - upstream NavRL 依赖全向感知，不是当前 DashGo `official` 线里意外收窄后的 `180°` 前向 LiDAR。
+  - DashGo 适配线保留了“到点且低速停稳”的成功终止语义，因此需要一个与该终止条件一致的终态奖励；否则训练目标和成功定义继续错位。
+  - DashGo 适配层应保留完整 `246` 维观测中的非 LiDAR `30` 维切片，继续走 NavRL 的 `lidar/state/dynamic_obstacle` 三路输入，而不是把 state 压成 `8` 维。
+- 已实施修正：
+  - `src/navrl_dashgo/env_adapter.py`
+    - `STATE_DIM` 从压缩后的 `8` 维恢复为完整非 LiDAR `30` 维。
+    - `DashgoTensorAdapter.encode()` 直接保留 `[216:246]` 全切片，恢复 waypoint/goal/速度/角速度/last_action 的历史信息。
+  - `src/dashgo_rl/dashgo_env_navrl_official.py`
+    - LiDAR 从 `horizontal_fov_range=(-90.0, 90.0)` 改为 `(-180.0, 180.0)`，分辨率同步改为 `360.0 / 72`。
+    - 在 reward 主干里新增 `navrl_goal_reached_bonus`，权重 `12.0`，直接复用当前 `reach_goal` 的距离与低速阈值。
+  - `tests/test_env_and_ppo_guards.py`
+    - 新增 `build_state_observation()` 回归测试，锁住完整 `30` 维 state slice。
+    - 新增 `official env` 源码约束测试，锁住 `360°` LiDAR 和 `goal_reached_bonus_weight=12.0`。
+- 验证结果：
+  - 定向：
+    - `PYTHONPATH=/home/gwh/dashgo_navrl_project/src:/home/gwh/dashgo_navrl_project /home/gwh/IsaacLab/_isaac_sim/python.sh -m unittest tests.test_env_and_ppo_guards -v`
+    - `11 tests OK`
+  - 全量：
+    - `PYTHONPATH=/home/gwh/dashgo_navrl_project/src:/home/gwh/dashgo_navrl_project /home/gwh/IsaacLab/_isaac_sim/python.sh -m unittest discover -s tests -q`
+    - `34 tests OK`
+- 仍然保留的边界：
+  - 还没有重新引入旧 DashGo 的外层 `heading_guard/recovery/safety_filter`。
+  - 还没有为 reverse case 单独加 recovery curriculum。
+  - 因此这次提交修复的是“训练目标与感知合同偏差”，不是直接宣称当前策略效果已经追平旧 DashGo 系统。

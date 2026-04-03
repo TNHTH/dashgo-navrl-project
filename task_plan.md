@@ -129,6 +129,46 @@ Phase 20
 - [ ] 视需要再创建 PR 或继续补充后续提交
 - **Status:** in_progress
 
+### Phase 21: 接续训练能力改造与实机续训
+- [x] 为训练入口新增 `resume_from` 与 `resume_optimizer_state` 配置
+- [x] 抽离 checkpoint 读写/恢复逻辑，并兼容旧 checkpoint 的 `frame_count + inference_state_dict`
+- [x] 让新 checkpoint 额外保存优化器状态，供后续受控试验使用
+- [x] 补齐 resume 回归单测并通过全量 `32` 项测试
+- [x] 用已完成的 `formal_20260403_003355/checkpoint_final.pt` 真实续训 `1` 个 batch 验证兼容路径
+- [x] 发现“恢复优化器状态”会在当前 Isaac/PhysX/CUDA 栈上触发 illegal instruction，并切回默认禁用
+- [x] 基于兼容续训模式启动新的正式长窗口续训
+- [x] 挂起独立 watchdog，到 `2026-04-03 13:10:00 +0800` 自动停机
+- [ ] 持续值守并在训练结束后收取最终 checkpoint 与状态摘要
+- **Status:** in_progress
+
+### Phase 22: 暂停当前续训并评估当前仿真效果
+- [x] 停止当前 `formal_20260403_100334` 续训进程
+- [x] 锁定当前最新 checkpoint `checkpoint_242491392.pt`
+- [x] 基于当前 checkpoint 跑完 `quick` 仿真评测
+- [x] 基于当前 checkpoint 跑完 `main` 仿真评测
+- [x] 与现有 baseline JSON 做并排对比
+- [x] 回写“当前仿真效果”结论到项目台账
+- **Status:** complete
+
+### Phase 23: 根因检查与旧 DashGo 对比
+- [x] 核对当前正式训练主链实际使用的是 `dashgo_env_navrl_official.py`
+- [x] 对比当前 `official` 奖励主干与旧 `dashgo_env_v2.py` 的 shaping 差异
+- [x] 对比 `env_adapter` 压缩后的观测与旧 `246` 维合同差异
+- [x] 核对 reverse case 训练分布是否覆盖旧 DashGo 的 recovery 语义
+- [x] 核对旧 DashGo ROS2 控制链中 `heading_guard/recovery/safety_filter` 的额外守护
+- [x] 回写“为什么当前效果更差”的结构化结论到项目台账
+- **Status:** complete
+
+### Phase 24: 保留 NavRL 主体思路并修正 DashGo 适配偏差
+- [x] 对照 upstream `NavRL` 核对当前 DashGo `official` 线的关键偏差点
+- [x] 把 `env_adapter` 的 state 分支恢复为完整 `30` 维非 LiDAR 切片
+- [x] 把 `official` 环境 LiDAR 改回全向 `360°` 感知
+- [x] 在不回退旧 DashGo 厚 shaping 的前提下，为当前成功终止语义补充对齐的 goal bonus
+- [x] 增补回归测试，锁住 `30` 维 state / `360°` LiDAR / goal bonus 三个约束
+- [x] 跑通定向 `11` 项测试
+- [x] 跑通全量 `34` 项测试
+- **Status:** complete
+
 ## Key Questions
 1. 旧 DashGo 246 维观测如何稳定切分为 `state/lidar/dynamic_obstacle` 三路输入？
 2. 新仓库如何在不改旧仓库的前提下复用 DashGo Isaac 环境并切换到 TorchRL PPO？
@@ -152,6 +192,7 @@ Phase 20
 | 在用户明确指出 GPU 利用率偏低后，优先改为“先测参再长跑” | 长跑前先把吞吐和 GPU 占用压到更优，比盲目按旧配置跑满更有效 |
 | 当前已测最佳长探针配置升级为 `formal + dashgo_official + cameras off + env.num_envs=256` | `131072 frames` 探针下测得 `3885.6 fps / 99% GPU / 62.4% memory_ratio`，优于 `96/128/160/192/224 env` |
 | 上传 GitHub 不直接改写当前正在训练的工作树，而是通过 `origin/main` 临时 clone 提交推送新分支 | 避免训练过程中文件系统切换扰动 live run |
+| 接续训练默认采用“恢复模型参数 + value_norm + frame_count，但默认不恢复优化器状态” | 旧 checkpoint 兼容续训已实机通过；恢复优化器状态在当前 Isaac/PhysX/CUDA 栈上触发 illegal instruction，稳定性优先 |
 
 ## Errors Encountered
 | Error | Attempt | Resolution |

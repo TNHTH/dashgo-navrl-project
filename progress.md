@@ -609,3 +609,201 @@
   - GitHub 已返回新分支创建成功
   - PR 入口：
     - `https://github.com/TNHTH/dashgo-navrl-project/pull/new/codex/bench-and-upload-20260403`
+
+### Phase 21: 接续训练能力改造与实机续训
+- **Status:** in_progress
+- Actions taken:
+  - 为训练配置新增：
+    - `resume_from`
+    - `resume_optimizer_state`
+  - 新增 `src/navrl_dashgo/checkpointing.py`：
+    - 统一 checkpoint payload 构建
+    - 统一旧/新 checkpoint 的恢复逻辑
+    - 统一 `frame_count` 与剩余帧数解析
+  - 改造 `apps/isaac/train_navrl.py`：
+    - 支持从已有 checkpoint 恢复模型参数与 `frame_count`
+    - 新 checkpoint 额外保存 `optimizer_state_dict`
+    - 恢复训练时按累计 `max_frame_num` 继续推进 global frame
+  - 改造 `tools/background_train.py`：
+    - 将 `resume_from=...` 写入 supervisor 状态
+  - 新增值守脚本：
+    - `tools/watch_background_train_until.py`
+  - 新增回归测试：
+    - `tests/test_checkpointing_resume.py`
+  - 使用已完成 formal run 的 checkpoint 做真实续训验证：
+    - `/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_003355/checkpoints/checkpoint_final.pt`
+    - 成功续训到 `/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_095758/checkpoints/checkpoint_final.pt`
+  - 再次从新 checkpoint 续训验证兼容模式：
+    - `/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_095758/checkpoints/checkpoint_final.pt`
+    - 成功续训到 `/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100241/checkpoints/checkpoint_final.pt`
+  - 识别并隔离“恢复优化器状态”的风险：
+    - 从 `/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_095758/checkpoints/checkpoint_final.pt`
+    - 启用优化器状态恢复的长窗口 run `/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100010`
+    - 在首个 update 阶段触发 `CUDA illegal instruction`
+    - 因此默认回退到 `resume_optimizer_state=false`
+  - 以兼容续训模式启动新的正式长窗口续训：
+    - `python3 tools/background_train.py start --profile formal max_frame_num=260005888 env.num_envs=256 save_interval_batches=50 logging.print_interval_batches=50 resume_from=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100241/checkpoints/checkpoint_final.pt`
+  - 启动独立 watchdog：
+    - `python3 tools/watch_background_train_until.py --profile formal --until 2026-04-03T13:10:00+08:00 --poll-seconds 60 --log-path /home/gwh/dashgo_navrl_project/artifacts/supervisor/formal/watchdog_resume_until_20260403_131000.log`
+- Files created/modified:
+  - `configs/train/train.yaml`
+  - `src/navrl_dashgo/checkpointing.py`
+  - `apps/isaac/train_navrl.py`
+  - `tools/background_train.py`
+  - `tools/watch_background_train_until.py`
+  - `tests/test_checkpointing_resume.py`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+- Runtime facts:
+  - 当前 live run：
+    - `run_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100334`
+    - `pid=11001`
+    - `resume_from=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100241/checkpoints/checkpoint_final.pt`
+    - `frames_per_batch=8192`
+    - `target_total_frames=260005888`
+  - 当前 watchdog：
+    - `pid=11411`
+    - `log=/home/gwh/dashgo_navrl_project/artifacts/supervisor/formal/watchdog_resume_until_20260403_131000.log`
+    - `target_stop_at=2026-04-03 13:10:00 +0800`
+- Verification snapshot:
+  - `PYTHONPATH=/home/gwh/dashgo_navrl_project/src:/home/gwh/dashgo_navrl_project /home/gwh/IsaacSim/python.sh -m unittest tests.test_checkpointing_resume -v`
+    - `4 tests OK`
+  - `PYTHONPATH=/home/gwh/dashgo_navrl_project/src:/home/gwh/dashgo_navrl_project /home/gwh/IsaacSim/python.sh -m unittest discover -s tests -q`
+    - `32 tests OK`
+  - 真实兼容续训验证日志已出现：
+    - `resume_from=... start_frame_count=176439296 remaining_frames=8192 resume_optimizer_state=False`
+    - `batch=21538 frames=176447488 ...`
+    - `checkpoint=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100241/checkpoints/checkpoint_176447488.pt`
+  - 当前 live 长窗口续训日志已出现：
+    - `run_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100334`
+    - `resume_from=... start_frame_count=176447488 remaining_frames=83558400 resume_optimizer_state=False`
+    - `batch=21550 frames=176545792 ...`
+    - `checkpoint=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100334/checkpoints/checkpoint_176545792.pt`
+  - watchdog 日志已连续出现：
+    - `watchdog_started`
+    - `heartbeat supervisor_status=running active_process_count=1`
+
+### Phase 22: 暂停当前续训并评估当前仿真效果
+- **Status:** complete
+- Actions taken:
+  - 按用户要求停止当前续训：
+    - `python3 tools/background_train.py stop --profile formal`
+  - 锁定当前最新 checkpoint：
+    - `/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100334/checkpoints/checkpoint_242491392.pt`
+  - 运行 quick 评测：
+    - `/home/gwh/IsaacSim/python.sh tools/eval_checkpoint.py --checkpoint ...checkpoint_242491392.pt --suite quick --json-out /home/gwh/dashgo_navrl_project/artifacts/eval/candidate_checkpoint_242491392_quick.json`
+  - 运行 main 评测：
+    - `/home/gwh/IsaacSim/python.sh tools/eval_checkpoint.py --checkpoint ...checkpoint_242491392.pt --suite main --json-out /home/gwh/dashgo_navrl_project/artifacts/eval/candidate_checkpoint_242491392_main.json`
+  - 复用已有 baseline JSON 做对比：
+    - `compare_quick_checkpoint_242491392.json`
+    - `compare_main_checkpoint_242491392.json`
+- Runtime facts:
+  - 训练已停，supervisor 当前为：
+    - `blocked_exited`
+  - 当前 run：
+    - `run_root=/home/gwh/dashgo_navrl_project/artifacts/runs/formal_20260403_100334`
+  - 当前 watchdog 已自然退出，不再驻留
+- Verification snapshot:
+  - quick：
+    - `success_rate=0.0`
+    - `collision_rate=0.8333`
+    - `progress_stall_rate=0.6667`
+    - `path_efficiency=0.1015`
+    - `behavior_gate_veto`
+  - main：
+    - `success_rate=0.0`
+    - `collision_rate=0.875`
+    - `hard_stop_rate=0.875`
+    - `progress_stall_rate=0.7292`
+    - `path_efficiency=0.0963`
+    - `behavior_gate_veto`
+  - 模式摘要：
+    - 正向场景能推进一点，但大多撞障结束
+    - 倒车场景几乎不会处理，`path_efficiency≈0`
+
+### Phase 23: 检查“为什么当前效果比旧 DashGo 更差”
+- **Status:** complete
+- Actions taken:
+  - 并行核对当前正式训练主链实际使用的环境与奖励：
+    - `src/navrl_dashgo/env_adapter.py`
+    - `src/dashgo_rl/dashgo_env_navrl_official.py`
+  - 对比旧 `dashgo` 训练主线的奖励、观测合同与策略结构：
+    - `src/dashgo_rl/dashgo_env_v2.py`
+    - `src/dashgo_rl/observation_contract.py`
+    - `src/dashgo_rl/geo_nav_policy.py`
+  - 核对旧 `dashgo` ROS2 实际控制链中的额外守护逻辑：
+    - `workspaces/ros2_ws/src/dashgo_rl_ros2/dashgo_rl_ros2/geo_nav_node.py`
+  - 复核当前 checkpoint 在 `quick/main` 下 forward / reverse 的分组表现
+- Runtime facts:
+  - 当前正式训练主链使用的是：
+    - `env_adapter -> DashgoNavOfficialEnvCfg`
+  - 当前评测是裸 PPO policy 仿真，不包含旧系统的：
+    - `heading_guard`
+    - `turn_in_place`
+    - `recovery`
+    - `safety_filter`
+- Verification snapshot:
+  - 当前 `official` 环境奖励主干没有旧 DashGo 的：
+    - `reach_goal=80.0`
+    - `shaping_distance`
+    - `target_speed`
+    - `facing_goal`
+    - `obstacle_proximity`
+    - `reverse_escape`
+  - 当前 `env_adapter` 将旧 `246` 维观测压成：
+    - `72x3` LiDAR
+    - `8` 维 state
+    - `dynamic_obstacle tokens`
+    - 并丢掉 `last_action_history`
+  - 当前 `official` 目标采样仅为：
+    - 半径 `1.0~4.0m`
+    - 方位 `[-pi, pi]` 均匀采样
+    - 没有旧 `dashgo_env_v2.py` 的 recovery scenario 注入
+  - 当前 checkpoint 分组表现：
+    - quick forward：`collision_rate=0.8571`，`avg_path_efficiency=0.1740`
+    - quick reverse：`collision_rate=0.8000`，`avg_path_efficiency=0.0`
+    - main forward：`collision_rate=0.8000`，`avg_path_efficiency=0.1848`
+    - main reverse：`collision_rate=0.9565`，`avg_path_efficiency≈0`
+- Conclusion:
+  - 当前效果劣于旧 DashGo 的直接原因不是“没学会动”，而是：
+    - 成功奖励缺失
+    - 状态时序信息被压缩
+    - 倒车脱困分布没覆盖
+    - 外层控制守护链未接入
+  - 因此当前策略被优化成了“敢推进，但不安全，也不会 reverse recovery”。
+
+### Phase 24: 保留 NavRL 主体思路并修正 DashGo 适配偏差
+- **Status:** complete
+- Actions taken:
+  - 对照 upstream `NavRL` 和当前 DashGo 适配线，收敛本轮只修三个已坐实的偏差：
+    - `env_adapter` state 分支被误压成 `8` 维
+    - `official` 环境 LiDAR 被收窄成 `180°`
+    - DashGo 成功终止语义缺少对齐的 goal bonus
+  - 修改：
+    - `src/navrl_dashgo/env_adapter.py`
+      - 新增 `build_state_observation()`
+      - `STATE_DIM` 恢复为 `30`
+      - `DashgoTensorAdapter.encode()` 直接保留 `[216:246]` 的完整非 LiDAR 历史切片
+    - `src/dashgo_rl/dashgo_env_navrl_official.py`
+      - LiDAR FOV 改为 `(-180.0, 180.0)`
+      - LiDAR 角分辨率改为 `360.0 / SIM_LIDAR_POLICY_DIM`
+      - 新增 `goal_reached_bonus_weight=12.0`
+      - 新增 `reward_navrl_goal_reached_bonus()` 与 `navrl_goal_reached_bonus = RewardTermCfg(...)`
+    - `tests/test_env_and_ppo_guards.py`
+      - 新增 `30` 维 state slice 回归测试
+      - 新增 `360°` LiDAR 与 goal bonus 源码约束测试
+- Runtime facts:
+  - 目标仓库工作树仍是未建提交历史的异常状态：
+    - `git -C /home/gwh/dashgo_navrl_project status --short --branch`
+    - `## 尚无提交在 codex/bench-and-upload-20260403`
+  - 为避免扰动该工作树，继续使用干净 clone：
+    - `/tmp/dashgo_navrl_git`
+    - 当前分支：`codex/navrl-rootcause-fix-20260403`
+- Verification snapshot:
+  - 定向：
+    - `PYTHONPATH=/home/gwh/dashgo_navrl_project/src:/home/gwh/dashgo_navrl_project /home/gwh/IsaacLab/_isaac_sim/python.sh -m unittest tests.test_env_and_ppo_guards -v`
+    - `11 tests OK`
+  - 全量：
+    - `PYTHONPATH=/home/gwh/dashgo_navrl_project/src:/home/gwh/dashgo_navrl_project /home/gwh/IsaacLab/_isaac_sim/python.sh -m unittest discover -s tests -q`
+    - `34 tests OK`

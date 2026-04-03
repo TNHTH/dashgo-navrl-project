@@ -43,6 +43,9 @@ REWARD_CONFIG = {
     # 保持碰撞判据不变，避免靠放松安全线“做高”成功率。
     "goal_termination_threshold": 0.6,
     "goal_stop_velocity": 0.08,
+    # 当前 DashGo 终止条件要求“到点且低速停稳”，补一个对齐该判据的终态奖励，
+    # 但保留 NavRL 以速度/安全为主的主体思路，不回退到旧版大规模 shaping。
+    "goal_reached_bonus_weight": 12.0,
     "dynamic_collision_threshold": 0.3,
     "static_collision_threshold": 0.3,
     "survival_weight": 0.15,
@@ -541,6 +544,22 @@ def reward_navrl_waypoint_velocity(
     return reward_distance_tracking_potential(env, command_name, asset_cfg, target_kind="waypoint")
 
 
+def reward_navrl_goal_reached_bonus(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    threshold: float,
+    speed_threshold: float,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    return check_reach_goal(
+        env,
+        command_name=command_name,
+        threshold=threshold,
+        speed_threshold=speed_threshold,
+        asset_cfg=asset_cfg,
+    ).float()
+
+
 def reward_navrl_static_safety(env: ManagerBasedRLEnv) -> torch.Tensor:
     clearance = torch.clamp(_get_lidar_scan_m(env), min=1.0e-6, max=SIM_LIDAR_MAX_RANGE)
     return torch.nan_to_num(torch.log(clearance).mean(dim=1), nan=0.0, posinf=0.0, neginf=0.0)
@@ -990,8 +1009,8 @@ class DashgoSceneOfficialCfg(InteractiveSceneCfg):
         pattern_cfg=patterns.LidarPatternCfg(
             channels=1,
             vertical_fov_range=(0.0, 0.0),
-            horizontal_fov_range=(-90.0, 90.0),
-            horizontal_res=180.0 / float(SIM_LIDAR_POLICY_DIM),
+            horizontal_fov_range=(-180.0, 180.0),
+            horizontal_res=360.0 / float(SIM_LIDAR_POLICY_DIM),
         ),
         debug_vis=False,
         max_distance=SIM_LIDAR_MAX_RANGE,
@@ -1010,6 +1029,16 @@ class DashgoSceneOfficialCfg(InteractiveSceneCfg):
 @configclass
 class DashgoRewardsOfficialCfg:
     navrl_survival = RewardTermCfg(func=reward_navrl_survival_bias, weight=REWARD_CONFIG["survival_weight"])
+    navrl_goal_reached_bonus = RewardTermCfg(
+        func=reward_navrl_goal_reached_bonus,
+        weight=REWARD_CONFIG["goal_reached_bonus_weight"],
+        params={
+            "command_name": "target_pose",
+            "threshold": REWARD_CONFIG["goal_termination_threshold"],
+            "speed_threshold": REWARD_CONFIG["goal_stop_velocity"],
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
     navrl_goal_velocity = RewardTermCfg(
         func=reward_navrl_goal_velocity,
         weight=REWARD_CONFIG["goal_velocity_weight"],

@@ -20,7 +20,7 @@ if "dashgo_rl.dashgo_env_navrl_official" not in sys.modules:
     dashgo_stub.terrain_debug_summary = lambda *args, **kwargs: {}
     sys.modules["dashgo_rl.dashgo_env_navrl_official"] = dashgo_stub
 
-from navrl_dashgo.env_adapter import resolve_map_source
+from navrl_dashgo.env_adapter import STATE_DIM, build_state_observation, resolve_map_source
 from navrl_dashgo.env_adapter import TorchRLDashgoEnv
 from navrl_dashgo.ppo import (
     NonFiniteTrainingStateError,
@@ -136,6 +136,22 @@ class EnvAndPPOGuardsTest(unittest.TestCase):
         self.assertEqual(obstacle_cfg.obstacle_height_mode, "choice")
         self.assertEqual(tuple(obstacle_cfg.obstacle_height_range), (1.0, 6.0))
         self.assertEqual(int(obstacle_cfg.num_obstacles), 12)
+
+    def test_official_env_keeps_navrl_full_circle_lidar_and_goal_bonus(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1] / "src" / "dashgo_rl" / "dashgo_env_navrl_official.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("horizontal_fov_range=(-180.0, 180.0)", source)
+        self.assertIn("horizontal_res=360.0 / float(SIM_LIDAR_POLICY_DIM)", source)
+        self.assertIn('"goal_reached_bonus_weight": 12.0', source)
+        self.assertIn("navrl_goal_reached_bonus = RewardTermCfg(", source)
+
+    def test_build_state_observation_keeps_full_non_lidar_slice(self) -> None:
+        policy_obs = torch.arange(246, dtype=torch.float32).reshape(1, -1)
+        state = build_state_observation(policy_obs)
+        expected = torch.arange(216, 246, dtype=torch.float32).reshape(1, -1)
+        self.assertEqual(state.shape, (1, STATE_DIM))
+        self.assertTrue(torch.equal(state, expected))
 
     def test_bootstrap_done_flags_treats_truncated_as_done(self) -> None:
         next_tensordict = TensorDict(
